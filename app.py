@@ -216,6 +216,8 @@ def filter_months(df: pd.DataFrame, period: int, months: list) -> pd.DataFrame:
 # TRマスタ永続化（parquet）
 # ─────────────────────────────────────────────
 import pathlib
+_IDPOS_CACHE    = pathlib.Path(__file__).parent / ".idpos_cache.parquet"
+_SRI_CACHE      = pathlib.Path(__file__).parent / ".sri_cache.parquet"
 _TRMASTER_CACHE = pathlib.Path(__file__).parent / ".trmaster_cache.parquet"
 _MASTER_CACHE   = pathlib.Path(__file__).parent / ".master_cache.parquet"
 
@@ -235,14 +237,47 @@ def load_master_cache() -> pd.DataFrame | None:
         return pd.read_parquet(_MASTER_CACHE)
     return None
 
+def save_idpos(df: pd.DataFrame):
+    df.to_parquet(_IDPOS_CACHE, index=False)
+
+def load_idpos_cache() -> pd.DataFrame | None:
+    if _IDPOS_CACHE.exists():
+        return pd.read_parquet(_IDPOS_CACHE)
+    return None
+
+def save_sri(df: pd.DataFrame):
+    df.to_parquet(_SRI_CACHE, index=False)
+
+def load_sri_cache() -> pd.DataFrame | None:
+    if _SRI_CACHE.exists():
+        return pd.read_parquet(_SRI_CACHE)
+    return None
+
 # ─────────────────────────────────────────────
 # サイドバー: ファイルアップロード
 # ─────────────────────────────────────────────
 with st.sidebar:
     show_upload = st.toggle("📁 データアップロード", value=True, key="show_upload")
     if show_upload:
-        idpos_file    = st.file_uploader("① IDPOS CSV", type=["csv"], key="idpos")
-        sri_file      = st.file_uploader("② SRI Excel（2年分）", type=["xlsx","xls"], key="sri")
+        idpos_file = st.file_uploader("① IDPOS CSV（更新時のみ）", type=["csv"], key="idpos",
+                                      help="アップロードするとローカルに保存され、次回以降は不要です")
+        if idpos_file:
+            st.caption("✅ IDPOSを保存しました（次回以降は不要）")
+        elif _IDPOS_CACHE.exists():
+            st.caption("💾 保存済みIDPOSを使用中")
+            if st.button("🗑️ IDPOSをリセット", key="idpos_reset"):
+                _IDPOS_CACHE.unlink(missing_ok=True)
+                st.rerun()
+
+        sri_file = st.file_uploader("② SRI Excel（更新時のみ）", type=["xlsx","xls"], key="sri",
+                                    help="アップロードするとローカルに保存され、次回以降は不要です")
+        if sri_file:
+            st.caption("✅ SRIを保存しました（次回以降は不要）")
+        elif _SRI_CACHE.exists():
+            st.caption("💾 保存済みSRIを使用中")
+            if st.button("🗑️ SRIをリセット", key="sri_reset"):
+                _SRI_CACHE.unlink(missing_ok=True)
+                st.rerun()
         master_file   = st.file_uploader(
             "③ マスタ CSV（半期更新）", type=["csv"], key="master",
             help="アップロードするとローカルに保存され、次回以降は不要です",
@@ -267,7 +302,6 @@ with st.sidebar:
             if st.button("🗑️ TRマスタをリセット", key="trmaster_reset"):
                 _TRMASTER_CACHE.unlink(missing_ok=True)
                 st.rerun()
-        if idpos_file: st.success("ファイルを受け付けました")
     else:
         idpos_file   = st.session_state.get("idpos")
         sri_file     = st.session_state.get("sri")
@@ -276,7 +310,7 @@ with st.sidebar:
 
 st.title("📊 メンズビューティ販売分析ダッシュボード")
 
-if not idpos_file:
+if idpos_file is None and not _IDPOS_CACHE.exists():
     st.info("👈 サイドバーからIDPOS CSVをアップロードしてください")
     st.stop()
 
@@ -284,8 +318,17 @@ if not idpos_file:
 # データ読み込み
 # ─────────────────────────────────────────────
 with st.spinner("データ読み込み中..."):
-    df_all = load_idpos(idpos_file)
-    df_sri = load_sri(sri_file) if sri_file else None
+    if idpos_file:
+        df_all = load_idpos(idpos_file)
+        save_idpos(df_all)
+    else:
+        df_all = load_idpos_cache()
+
+    if sri_file:
+        df_sri = load_sri(sri_file)
+        save_sri(df_sri)
+    else:
+        df_sri = load_sri_cache()
 
     # マスタCSV: 新規アップロード → 保存 → 以降はキャッシュから
     if master_file:

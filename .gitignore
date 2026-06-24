@@ -9,6 +9,8 @@ __pycache__/
 *.xls
 
 # キャッシュファイル（ローカル保存・業務データ含むため除外）
+.idpos_cache.parquet
+.sri_cache.parquet
 .trmaster_cache.parquet
 .master_cache.parquet
 
