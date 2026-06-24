@@ -599,8 +599,7 @@ with tab_subseg:
             agg_ss["前期平均単価"] = agg_ss["売上金額_前期"] / agg_ss["売上数量_前期"].replace(0, np.nan)
             agg_ss["平均単価昨対"] = agg_ss["平均単価"] / agg_ss["前期平均単価"].replace(0, np.nan) * 100
 
-        if "ID客数" in agg_ss.columns and "POS客数" in agg_ss.columns:
-            agg_ss["ID率(%)"] = agg_ss["ID客数"] / agg_ss["POS客数"].replace(0, np.nan) * 100
+        agg_ss["ID昨対"] = safe_yoy("ID客数", "ID客数_前期", agg_ss)
 
         # 市場前年比・GAP（サブセグメント粒度）
         mrk_ss = compute_market(df_sri, df_trmaster, grp,
@@ -616,7 +615,7 @@ with tab_subseg:
             "平均単価","平均単価昨対",
             "購買単価","単価昨対",
             "POS客数","POS昨対",
-            "ID率(%)",
+            "ID客数","ID昨対",
         ] if c in agg_ss.columns]
         fmt2 = {
             "売上金額":   "¥{:,.0f}",
@@ -631,13 +630,14 @@ with tab_subseg:
             "単価昨対":   "{:.1f}%",
             "POS客数":    "{:,.0f}",
             "POS昨対":    "{:.1f}%",
-            "ID率(%)":    "{:.1f}%",
+            "ID客数":     "{:,.0f}",
+            "ID昨対":     "{:.1f}%",
         }
 
         # 昨対比・GAP列のカラースケール
         def color_yoy_cols(df):
             styles = pd.DataFrame("", index=df.index, columns=df.columns)
-            for col in ["金額昨対","数量昨対","平均単価昨対","単価昨対","POS昨対"]:
+            for col in ["金額昨対","数量昨対","平均単価昨対","単価昨対","POS昨対","ID昨対"]:
                 if col not in df.columns: continue
                 for idx, val in df[col].items():
                     if pd.isna(val): continue
