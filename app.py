@@ -875,6 +875,22 @@ with tab_rank:
     if df_mst is not None:
         jan_agg = jan_agg.merge(df_mst[["JAN","採用店舗数"]], on="JAN", how="left")
 
+    # 市場前年比・昨対GAP（JAN単位でSRIデータと結合）
+    if df_sri is not None:
+        today_yms_rank = [mip_to_yyyymm(sel_period,     m) for m in sel_months]
+        prev_yms_rank  = [mip_to_yyyymm(sel_period - 1, m) for m in sel_months]
+        sri_today = (df_sri[df_sri["YYYYMM"].isin(today_yms_rank)]
+                     .groupby("JAN")["市場金額"].sum().reset_index()
+                     .rename(columns={"市場金額": "市場金額_今期"}))
+        sri_prev  = (df_sri[df_sri["YYYYMM"].isin(prev_yms_rank)]
+                     .groupby("JAN")["市場金額"].sum().reset_index()
+                     .rename(columns={"市場金額": "市場金額_前年"}))
+        sri_jan = sri_today.merge(sri_prev, on="JAN", how="outer")
+        sri_jan["市場前年比"] = sri_jan["市場金額_今期"] / sri_jan["市場金額_前年"].replace(0, np.nan) * 100
+        jan_agg = jan_agg.merge(sri_jan[["JAN","市場前年比"]], on="JAN", how="left")
+        if "昨対比" in jan_agg.columns:
+            jan_agg["昨対GAP"] = jan_agg["昨対比"] - jan_agg["市場前年比"]
+
     jan_agg = jan_agg.sort_values(rank_by, ascending=False).head(top_n).reset_index(drop=True)
     jan_agg.insert(0, "順位", range(1, len(jan_agg)+1))
 
@@ -885,16 +901,41 @@ with tab_rank:
     base_cols += ["売上金額","売上数量","平均単価"]
     if show_prev and "前期売上金額" in jan_agg.columns:
         base_cols += ["前期売上金額","昨対比","数量昨対","平均単価昨対"]
+    if "市場前年比" in jan_agg.columns: base_cols.append("市場前年比")
+    if "昨対GAP"   in jan_agg.columns: base_cols.append("昨対GAP")
     if "採用店舗数" in jan_agg.columns: base_cols.append("採用店舗数")
 
     base_cols = [c for c in base_cols if c in jan_agg.columns]
     fmt_r = {
         "売上金額":"¥{:,.0f}","前期売上金額":"¥{:,.0f}","売上数量":"{:,.0f}",
         "平均単価":"¥{:,.0f}","昨対比":"{:.1f}%","数量昨対":"{:.1f}%",
-        "平均単価昨対":"{:.1f}%","採用店舗数":"{:.0f}",
+        "平均単価昨対":"{:.1f}%","市場前年比":"{:.1f}%","昨対GAP":"{:+.1f}pp",
+        "採用店舗数":"{:.0f}",
     }
+
+    def color_rank_table(df):
+        styles = pd.DataFrame("", index=df.index, columns=df.columns)
+        for col in ["昨対比","数量昨対","平均単価昨対"]:
+            if col not in df.columns: continue
+            for idx, val in df[col].items():
+                if pd.isna(val): continue
+                if val >= 105:   styles.loc[idx, col] = "color:#1a7a1a; font-weight:bold"
+                elif val >= 100: styles.loc[idx, col] = "color:#2ca02c"
+                elif val >= 95:  styles.loc[idx, col] = "color:#ff7f0e"
+                else:            styles.loc[idx, col] = "color:#d62728; font-weight:bold"
+        if "昨対GAP" in df.columns:
+            for idx, val in df["昨対GAP"].items():
+                if pd.isna(val): continue
+                if val >= 3:    styles.loc[idx, "昨対GAP"] = "color:#1a7a1a; font-weight:bold"
+                elif val >= 0:  styles.loc[idx, "昨対GAP"] = "color:#2ca02c"
+                elif val >= -3: styles.loc[idx, "昨対GAP"] = "color:#ff7f0e"
+                else:           styles.loc[idx, "昨対GAP"] = "color:#d62728; font-weight:bold"
+        return styles
+
     st.dataframe(
-        jan_agg[base_cols].style.format({k:v for k,v in fmt_r.items() if k in base_cols}, na_rep="—"),
+        jan_agg[base_cols].style
+        .format({k:v for k,v in fmt_r.items() if k in base_cols}, na_rep="—")
+        .apply(color_rank_table, axis=None),
         use_container_width=True, hide_index=True, height=600,
     )
 
