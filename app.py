@@ -877,6 +877,7 @@ with tab_rank:
 
     # 市場前年比・昨対GAP（JAN単位でSRIデータと結合）
     if df_sri is not None:
+        jan_agg["JAN"] = jan_agg["JAN"].astype(str).str.zfill(13)
         today_yms_rank = [mip_to_yyyymm(sel_period,     m) for m in sel_months]
         prev_yms_rank  = [mip_to_yyyymm(sel_period - 1, m) for m in sel_months]
         sri_today = (df_sri[df_sri["YYYYMM"].isin(today_yms_rank)]
