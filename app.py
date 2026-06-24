@@ -1,3 +1,4 @@
+import re
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -30,6 +31,13 @@ def ym_to_period(ym: int):
 def ym_to_mip(ym: int) -> int:
     m = ym % 100
     return ((m - FISCAL_START_MONTH) % 12) + 1
+
+def mip_to_yyyymm(period: int, mip: int) -> int:
+    """期 + 期内月 → YYYYMM（例: 47期 期内月1 → 202507）"""
+    start = PERIOD_46[0] if period == 46 else PERIOD_47[0]
+    y, m = start // 100, start % 100
+    total = y * 12 + (m - 1) + (mip - 1)
+    return (total // 12) * 100 + (total % 12 + 1)
 
 def fmt_yen(v):
     if pd.isna(v): return "—"
@@ -74,31 +82,95 @@ def load_idpos(file) -> pd.DataFrame:
 
 @st.cache_data
 def load_sri(file) -> pd.DataFrame:
-    df = pd.read_excel(file, sheet_name="Sheet1", header=12, dtype=str)
-    df.columns = [str(c).strip().replace("\n", "") for c in df.columns]
-    jan_col = next((c for c in df.columns if "JAN" in c.upper()), df.columns[0])
-    df = df.rename(columns={jan_col: "JAN"})
+    """SRI+ エクスポートExcel（Sheet1, header=12）をロングフォームに変換して返す。
+    返り値: JAN(str,13桁), YYYYMM(int), 市場金額(円換算), 市場数量 の列を持つDF。
+    値は x1/1,000 表記なので ×1,000 して返す。
+    """
+    raw = pd.read_excel(file, sheet_name="Sheet1", header=12, dtype=str)
+    raw.columns = [str(c).strip() for c in raw.columns]
+
+    # JAN列は "Unnamed: 2"（3列目）
+    jan_col  = raw.columns[2]
+    # 月次金額列: "YYYY/M-"、月次数量列: "YYYY/M-.1"
+    amt_map = {}  # YYYYMM → col_name
+    qty_map = {}
+    for c in raw.columns:
+        m = re.match(r'^(\d{4})/(\d{1,2})-$', c)
+        if m:
+            amt_map[int(m.group(1)) * 100 + int(m.group(2))] = c
+        m2 = re.match(r'^(\d{4})/(\d{1,2})-\.1$', c)
+        if m2:
+            qty_map[int(m2.group(1)) * 100 + int(m2.group(2))] = c
+
+    # JAN が13桁数字の行だけ残す
+    raw["JAN"] = raw[jan_col].astype(str).str.strip().str.zfill(13)
+    df = raw[raw["JAN"].str.match(r'^\d{13}$')].copy()
+
+    def to_num(s):
+        return pd.to_numeric(s.astype(str).str.replace(",", "").str.replace("-", "0"), errors="coerce")
+
+    records = []
+    for yyyymm, acol in amt_map.items():
+        tmp = pd.DataFrame({"JAN": df["JAN"]})
+        tmp["YYYYMM"]   = yyyymm
+        tmp["市場金額"]  = to_num(df[acol]) * 1000
+        tmp["市場数量"]  = to_num(df[qty_map[yyyymm]]) * 1000 if yyyymm in qty_map else np.nan
+        records.append(tmp)
+
+    out = pd.concat(records, ignore_index=True)
+    return out[out["市場金額"].notna() & (out["市場金額"] > 0)].copy()
+
+
+@st.cache_data
+def load_trmaster(file) -> pd.DataFrame:
+    """月次レポートExcelからTRマスタシートを読み込む。
+    返り値: JAN, サブカテゴリー名, セグメント名, サブセグメント名
+    """
+    df = pd.read_excel(file, sheet_name="TRマスタ", header=0, dtype=str)
+    df.columns = df.columns.str.strip()
     df["JAN"] = df["JAN"].astype(str).str.zfill(13)
+    keep = [c for c in ["JAN", "サブカテゴリー名", "セグメント名", "サブセグメント名"] if c in df.columns]
+    return df[keep].drop_duplicates("JAN").reset_index(drop=True)
 
-    num_df = df.copy()
-    for c in num_df.columns:
-        num_df[c] = pd.to_numeric(num_df[c].astype(str).str.replace(",", ""), errors="coerce")
 
-    numeric_cols = [c for c in num_df.columns if num_df[c].notna().sum() > 0 and c != "JAN"]
+def compute_market(df_sri_long, df_trmaster,
+                   group_cols, subcat_col, seg_col, subseg_col,
+                   sel_period, sel_months) -> pd.DataFrame | None:
+    """選択期間の市場金額（今期・前年同期）と市場前年比をgroup_cols単位で集計して返す。"""
+    if df_sri_long is None or df_trmaster is None:
+        return None
 
-    def classify(col):
-        if any(k in col for k in ["前年", "前期", "前同期", "LY", "LAST"]):
-            return "市場規模_前期"
-        return "市場規模_今期"
+    # TRマスタの列名をIDPOSの列名に合わせてリネーム
+    col_rename = {}
+    if subcat_col and "サブカテゴリー名" in df_trmaster.columns: col_rename["サブカテゴリー名"] = subcat_col
+    if seg_col    and "セグメント名"     in df_trmaster.columns: col_rename["セグメント名"]     = seg_col
+    if subseg_col and "サブセグメント名" in df_trmaster.columns: col_rename["サブセグメント名"] = subseg_col
+    mst = df_trmaster.rename(columns=col_rename)
+    seg_cols_available = [c for c in group_cols if c in mst.columns]
+    if not seg_cols_available:
+        return None
 
-    result = df[["JAN"]].copy()
-    groups = {"市場規模_今期": [], "市場規模_前期": []}
-    for c in numeric_cols:
-        groups[classify(c)].append(c)
-    for label, cols in groups.items():
-        result[label] = num_df[cols].sum(axis=1) * 1000 if cols else np.nan
+    # 期間 → YYYYMM 変換
+    today_yms = [mip_to_yyyymm(sel_period,     m) for m in sel_months]
+    prev_yms  = [mip_to_yyyymm(sel_period - 1, m) for m in sel_months]
 
-    return result.dropna(subset=["JAN"])
+    joined = df_sri_long.merge(mst[["JAN"] + seg_cols_available], on="JAN", how="inner")
+
+    def agg_by(yms, label):
+        return (joined[joined["YYYYMM"].isin(yms)]
+                .groupby(seg_cols_available)["市場金額"].sum()
+                .reset_index().rename(columns={"市場金額": label}))
+
+    today = agg_by(today_yms, "市場金額_今期")
+    prev  = agg_by(prev_yms,  "市場金額_前年")
+    mrk = today.merge(prev, on=seg_cols_available, how="outer")
+    mrk["市場前年比"] = mrk["市場金額_今期"] / mrk["市場金額_前年"].replace(0, np.nan) * 100
+
+    # group_cols に足りない列を補完
+    for c in group_cols:
+        if c not in mrk.columns:
+            mrk[c] = np.nan
+    return mrk
 
 @st.cache_data
 def load_master(file) -> pd.DataFrame:
@@ -146,14 +218,16 @@ def filter_months(df: pd.DataFrame, period: int, months: list) -> pd.DataFrame:
 with st.sidebar:
     show_upload = st.toggle("📁 データアップロード", value=True, key="show_upload")
     if show_upload:
-        idpos_file  = st.file_uploader("① IDPOS CSV", type=["csv"], key="idpos")
-        sri_file    = st.file_uploader("② SRI Excel (ヘッダー13行目〜)", type=["xlsx","xls"], key="sri")
-        master_file = st.file_uploader("③ マスタ CSV", type=["csv"], key="master")
+        idpos_file    = st.file_uploader("① IDPOS CSV", type=["csv"], key="idpos")
+        sri_file      = st.file_uploader("② SRI Excel（2年分）", type=["xlsx","xls"], key="sri")
+        master_file   = st.file_uploader("③ マスタ CSV", type=["csv"], key="master")
+        monthly_file  = st.file_uploader("④ 月次レポート Excel（TRマスタ用）", type=["xlsx","xls"], key="monthly")
         if idpos_file: st.success("ファイルを受け付けました")
     else:
-        idpos_file  = st.session_state.get("idpos")
-        sri_file    = st.session_state.get("sri")
-        master_file = st.session_state.get("master")
+        idpos_file   = st.session_state.get("idpos")
+        sri_file     = st.session_state.get("sri")
+        master_file  = st.session_state.get("master")
+        monthly_file = st.session_state.get("monthly")
 
 st.title("📊 メンズビューティ販売分析ダッシュボード")
 
@@ -165,9 +239,10 @@ if not idpos_file:
 # データ読み込み
 # ─────────────────────────────────────────────
 with st.spinner("データ読み込み中..."):
-    df_all   = load_idpos(idpos_file)
-    df_sri   = load_sri(sri_file)    if sri_file    else None
-    df_mst   = load_master(master_file) if master_file else None
+    df_all      = load_idpos(idpos_file)
+    df_sri      = load_sri(sri_file)           if sri_file      else None
+    df_mst      = load_master(master_file)     if master_file   else None
+    df_trmaster = load_trmaster(monthly_file)  if monthly_file  else None
 
 # ─────────────────────────────────────────────
 # サイドバー: 期間・フィルタ設定
@@ -348,40 +423,42 @@ with tab_seg:
         if "売上金額_前期" in agg.columns:
             agg = agg.rename(columns={"売上金額_前期": "前期売上"})
 
-        # SRI市場シェア
-        if df_sri is not None and col_subcat:
-            jan_seg = df_cur[["JAN", col_subcat, col_seg] if col_seg else ["JAN", col_subcat]].drop_duplicates("JAN")
-            jan_sales = df_cur.groupby("JAN")["売上金額"].sum().reset_index()
-            jan_sales = jan_sales.merge(df_sri[["JAN","市場規模_今期"]], on="JAN", how="left")
-            jan_sales = jan_sales.merge(jan_seg, on="JAN", how="left")
-            jan_sales["市場規模_今期"] = pd.to_numeric(jan_sales["市場規模_今期"], errors="coerce")
-            sri_agg = jan_sales.groupby(group_cols).agg(
-                IDPOS売上=("売上金額","sum"), 市場規模=("市場規模_今期","sum")
-            ).reset_index()
-            sri_agg["市場シェア(%)"] = (sri_agg["IDPOS売上"] / sri_agg["市場規模"] * 100).round(2)
-            agg = agg.merge(sri_agg[group_cols + ["市場シェア(%)"]], on=group_cols, how="left")
+        # 市場データ（SRI × TRマスタ）
+        mrk = compute_market(df_sri, df_trmaster, group_cols,
+                             col_subcat, col_seg, col_subseg,
+                             sel_period, sel_months)
+        if mrk is not None:
+            agg = agg.merge(mrk[group_cols + ["市場前年比"]], on=group_cols, how="left")
+            agg["昨対GAP"] = agg["昨対比"] - agg["市場前年比"]
 
         # 表示列
-        show = [c for c in agg.columns if c in group_cols + ["売上金額","前期売上","昨対比","売上数量","POS客数","ID客数","市場シェア(%)"]]
+        show = [c for c in agg.columns if c in group_cols + [
+            "売上金額","前期売上","昨対比","市場前年比","昨対GAP","売上数量","POS客数","ID客数"]]
         fmt = {
-            "売上金額":   "¥{:,.0f}",
-            "前期売上":   "¥{:,.0f}",
-            "昨対比":     "{:.1f}%",
-            "売上数量":   "{:,.0f}",
-            "POS客数":    "{:,.0f}",
-            "ID客数":     "{:,.0f}",
-            "市場シェア(%)": "{:.2f}%",
+            "売上金額":    "¥{:,.0f}",
+            "前期売上":    "¥{:,.0f}",
+            "昨対比":      "{:.1f}%",
+            "市場前年比":  "{:.1f}%",
+            "昨対GAP":     "{:+.1f}pp",
+            "売上数量":    "{:,.0f}",
+            "POS客数":     "{:,.0f}",
+            "ID客数":      "{:,.0f}",
         }
         fmt_use = {k: v for k, v in fmt.items() if k in show}
 
         # サブカテゴリー小計行を差し込む
+        sum_cols = [c for c in ["売上金額","前期売上","売上数量","POS客数","ID客数"] if c in agg.columns]
         if col_subcat and col_seg:
-            subtotals = (
-                agg.groupby(col_subcat, as_index=False)
-                .agg({c: "sum" for c in ["売上金額","前期売上","売上数量","POS客数","ID客数"] if c in agg.columns})
-            )
+            subtotals = agg.groupby(col_subcat, as_index=False).agg({c: "sum" for c in sum_cols})
             if "売上金額" in subtotals.columns and "前期売上" in subtotals.columns:
-                subtotals["昨対比"] = (subtotals["売上金額"] / subtotals["前期売上"].replace(0, np.nan) ) * 100
+                subtotals["昨対比"] = subtotals["売上金額"] / subtotals["前期売上"].replace(0, np.nan) * 100
+            # 市場小計は按分せず再集計
+            if mrk is not None:
+                mrk_sub = (mrk.groupby(col_subcat)[["市場前年比"]].mean()
+                           .reset_index()) if col_subcat in mrk.columns else None
+                if mrk_sub is not None:
+                    subtotals = subtotals.merge(mrk_sub, on=col_subcat, how="left")
+                    subtotals["昨対GAP"] = subtotals["昨対比"] - subtotals["市場前年比"]
             subtotals[col_seg] = "【小計】"
             subtotals = subtotals.reindex(columns=agg.columns)
             combined = pd.concat([agg, subtotals]).sort_values([col_subcat, col_seg]).reset_index(drop=True)
@@ -390,26 +467,27 @@ with tab_seg:
 
         display_df = combined[show].reset_index(drop=True)
 
-        # 小計行のインデックスを特定してハイライト
-        if col_seg in display_df.columns:
-            is_subtotal = display_df[col_seg].astype(str) == "【小計】"
+        # スタイル: 小計行ハイライト + GAP色
+        def style_seg_table(df):
+            styles = pd.DataFrame("", index=df.index, columns=df.columns)
+            if col_seg in df.columns:
+                is_sub = df[col_seg].astype(str) == "【小計】"
+                styles.loc[is_sub] = "background-color:#fff3cd; font-weight:bold"
+            if "昨対GAP" in df.columns:
+                for idx, val in df["昨対GAP"].items():
+                    if pd.isna(val): continue
+                    if val >= 3:    styles.loc[idx, "昨対GAP"] = "color:#1a7a1a; font-weight:bold"
+                    elif val >= 0:  styles.loc[idx, "昨対GAP"] = "color:#2ca02c"
+                    elif val >= -3: styles.loc[idx, "昨対GAP"] = "color:#ff7f0e"
+                    else:           styles.loc[idx, "昨対GAP"] = "color:#d62728; font-weight:bold"
+            return styles
 
-            def highlight_subtotal(df):
-                styles = pd.DataFrame("", index=df.index, columns=df.columns)
-                styles.loc[is_subtotal] = "background-color:#fff3cd; font-weight:bold"
-                return styles
-
-            st.dataframe(
-                display_df.style
-                .format(fmt_use, na_rep="—")
-                .apply(highlight_subtotal, axis=None),
-                use_container_width=True, hide_index=True
-            )
-        else:
-            st.dataframe(
-                display_df.style.format(fmt_use, na_rep="—"),
-                use_container_width=True, hide_index=True
-            )
+        st.dataframe(
+            display_df.style
+            .format(fmt_use, na_rep="—")
+            .apply(style_seg_table, axis=None),
+            use_container_width=True, hide_index=True
+        )
 
         # ウォーターフォール風棒グラフ
         fig = px.bar(
@@ -476,26 +554,36 @@ with tab_subseg:
         if "ID客数" in agg_ss.columns and "POS客数" in agg_ss.columns:
             agg_ss["ID率(%)"] = agg_ss["ID客数"] / agg_ss["POS客数"].replace(0, np.nan) * 100
 
+        # 市場前年比・GAP（サブセグメント粒度）
+        mrk_ss = compute_market(df_sri, df_trmaster, grp,
+                                col_subcat, col_seg, col_subseg,
+                                sel_period, sel_months)
+        if mrk_ss is not None:
+            agg_ss = agg_ss.merge(mrk_ss[grp + ["市場前年比"]], on=grp, how="left")
+            agg_ss["昨対GAP"] = agg_ss["金額昨対"] - agg_ss["市場前年比"]
+
         show_cols = grp + [c for c in [
-            "売上金額","金額昨対",
+            "売上金額","金額昨対","市場前年比","昨対GAP",
             "売上数量","数量昨対",
             "購買単価","単価昨対",
             "POS客数","POS昨対",
             "ID率(%)",
         ] if c in agg_ss.columns]
         fmt2 = {
-            "売上金額":  "¥{:,.0f}",
-            "金額昨対":  "{:.1f}%",
-            "売上数量":  "{:,.0f}",
-            "数量昨対":  "{:.1f}%",
-            "購買単価":  "¥{:,.0f}",
-            "単価昨対":  "{:.1f}%",
-            "POS客数":   "{:,.0f}",
-            "POS昨対":   "{:.1f}%",
-            "ID率(%)":   "{:.1f}%",
+            "売上金額":   "¥{:,.0f}",
+            "金額昨対":   "{:.1f}%",
+            "市場前年比": "{:.1f}%",
+            "昨対GAP":    "{:+.1f}pp",
+            "売上数量":   "{:,.0f}",
+            "数量昨対":   "{:.1f}%",
+            "購買単価":   "¥{:,.0f}",
+            "単価昨対":   "{:.1f}%",
+            "POS客数":    "{:,.0f}",
+            "POS昨対":    "{:.1f}%",
+            "ID率(%)":    "{:.1f}%",
         }
 
-        # 昨対比列を100%基準でカラースケール
+        # 昨対比・GAP列のカラースケール
         def color_yoy_cols(df):
             styles = pd.DataFrame("", index=df.index, columns=df.columns)
             for col in ["金額昨対","数量昨対","単価昨対","POS昨対"]:
@@ -506,6 +594,13 @@ with tab_subseg:
                     elif val >= 100: styles.loc[idx, col] = "color:#2ca02c"
                     elif val >= 95:  styles.loc[idx, col] = "color:#ff7f0e"
                     else:            styles.loc[idx, col] = "color:#d62728; font-weight:bold"
+            if "昨対GAP" in df.columns:
+                for idx, val in df["昨対GAP"].items():
+                    if pd.isna(val): continue
+                    if val >= 3:    styles.loc[idx, "昨対GAP"] = "color:#1a7a1a; font-weight:bold"
+                    elif val >= 0:  styles.loc[idx, "昨対GAP"] = "color:#2ca02c"
+                    elif val >= -3: styles.loc[idx, "昨対GAP"] = "color:#ff7f0e"
+                    else:           styles.loc[idx, "昨対GAP"] = "color:#d62728; font-weight:bold"
             return styles
 
         st.dataframe(
