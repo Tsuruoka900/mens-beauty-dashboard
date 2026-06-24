@@ -449,7 +449,17 @@ for col, label, cur_v, prev_v in [
     ratio = yoy_ratio(cur_v, prev_v)
     val_str = fmt_yen(cur_v) if label in ("売上金額（税抜）", "平均単価", "購買単価") else f"{cur_v:,.0f}"
     col.metric(label, val_str)
-    col.caption(f"昨対比 **{fmt_yoy_ratio(ratio)}**")
+    if ratio is not None:
+        color = "#2ca02c" if ratio >= 100 else "#d62728"
+        arrow = "▲" if ratio >= 100 else "▼"
+        col.markdown(
+            f'<div style="font-size:1.3rem; font-weight:bold; color:{color};">'
+            f'{arrow} {ratio:.1f}%</div>'
+            f'<div style="font-size:0.75rem; color:#888;">昨対比</div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        col.caption("昨対比 —")
 filter_summary = "　".join(filter_labels) if filter_labels else "絞り込みなし（全て）"
 st.caption(f"表示期間: {period_label}　　絞り込み: {filter_summary}")
 
