@@ -1,0 +1,888 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+
+st.set_page_config(
+    page_title="メンズビューティ販売分析ダッシュボード",
+    page_icon="📊",
+    layout="wide",
+)
+
+# ─────────────────────────────────────────────
+# 定数
+# ─────────────────────────────────────────────
+FISCAL_START_MONTH = 7
+PERIOD_46 = (202407, 202506)
+PERIOD_47 = (202507, 202606)
+
+MONTH_LABEL = {
+    1: "7月", 2: "8月", 3: "9月", 4: "10月", 5: "11月", 6: "12月",
+    7: "1月", 8: "2月", 9: "3月", 10: "4月", 11: "5月", 12: "6月",
+}
+
+def ym_to_period(ym: int):
+    if PERIOD_46[0] <= ym <= PERIOD_46[1]: return 46
+    if PERIOD_47[0] <= ym <= PERIOD_47[1]: return 47
+    return None
+
+def ym_to_mip(ym: int) -> int:
+    m = ym % 100
+    return ((m - FISCAL_START_MONTH) % 12) + 1
+
+def fmt_yen(v):
+    if pd.isna(v): return "—"
+    if abs(v) >= 1_000_000: return f"¥{v/1_000_000:.1f}M"
+    if abs(v) >= 1_000: return f"¥{v/1_000:.0f}K"
+    return f"¥{v:.0f}"
+
+def fmt_yoy(v):
+    """昨対比を110.5%形式で表示。vは比率(110=前年比110%)"""
+    if pd.isna(v): return "—"
+    return f"{v:.1f}%"
+
+# ─────────────────────────────────────────────
+# データ読み込み
+# ─────────────────────────────────────────────
+@st.cache_data
+def load_idpos(file) -> pd.DataFrame:
+    df = pd.read_csv(file, encoding="cp932", dtype=str)
+    df.columns = df.columns.str.strip()
+
+    # 数値列マッピング
+    col_map = {
+        "売上数量":          "売上数量",
+        "売上数量(前期)":    "売上数量_前期",
+        "売上税抜金額(円)":          "売上金額",
+        "売上税抜金額(円)(前期)":    "売上金額_前期",
+        "POS客数":           "POS客数",
+        "POS客数(前期)":     "POS客数_前期",
+        "ID客数":            "ID客数",
+        "ID客数(前期)":      "ID客数_前期",
+    }
+    for orig, new in col_map.items():
+        if orig in df.columns:
+            df[new] = pd.to_numeric(df[orig].str.replace(",", ""), errors="coerce").fillna(0)
+
+    df["年月"] = pd.to_numeric(df["年月"], errors="coerce")
+    df["期"]   = df["年月"].apply(ym_to_period)
+    df["期内月"] = df["年月"].apply(ym_to_mip)
+    df = df[df["期"].notna()].copy()
+    df["期"] = df["期"].astype(int)
+    return df
+
+@st.cache_data
+def load_sri(file) -> pd.DataFrame:
+    df = pd.read_excel(file, sheet_name="Sheet1", header=12, dtype=str)
+    df.columns = [str(c).strip().replace("\n", "") for c in df.columns]
+    jan_col = next((c for c in df.columns if "JAN" in c.upper()), df.columns[0])
+    df = df.rename(columns={jan_col: "JAN"})
+    df["JAN"] = df["JAN"].astype(str).str.zfill(13)
+
+    num_df = df.copy()
+    for c in num_df.columns:
+        num_df[c] = pd.to_numeric(num_df[c].astype(str).str.replace(",", ""), errors="coerce")
+
+    numeric_cols = [c for c in num_df.columns if num_df[c].notna().sum() > 0 and c != "JAN"]
+
+    def classify(col):
+        if any(k in col for k in ["前年", "前期", "前同期", "LY", "LAST"]):
+            return "市場規模_前期"
+        return "市場規模_今期"
+
+    result = df[["JAN"]].copy()
+    groups = {"市場規模_今期": [], "市場規模_前期": []}
+    for c in numeric_cols:
+        groups[classify(c)].append(c)
+    for label, cols in groups.items():
+        result[label] = num_df[cols].sum(axis=1) * 1000 if cols else np.nan
+
+    return result.dropna(subset=["JAN"])
+
+@st.cache_data
+def load_master(file) -> pd.DataFrame:
+    df = pd.read_csv(file, encoding="cp932", dtype=str)
+    df.columns = df.columns.str.strip()
+
+    store_col = next((c for c in df.columns if "店舗CD" in c or "店舗コード" in c), None)
+    if store_col is None:
+        candidates = [c for c in df.columns if "CD" in c or "コード" in c]
+        store_col = candidates[2] if len(candidates) >= 3 else df.columns[4]
+
+    jan_col = next((c for c in df.columns if c == "JAN" or "JAN" in str(c).upper()), df.columns[0])
+    df = df.rename(columns={store_col: "店舗CD", jan_col: "JAN"})
+    df["JAN"] = df["JAN"].astype(str).str.zfill(13)
+
+    store_count = (df.groupby("JAN")["店舗CD"].nunique().reset_index()
+                   .rename(columns={"店舗CD": "採用店舗数"}))
+
+    type_col = next((c for c in df.columns if "タイプ" in c and "CD" not in c), None)
+    if type_col:
+        type_df = df[["JAN", type_col]].drop_duplicates("JAN").rename(columns={type_col: "タイプ分類"})
+        store_count = store_count.merge(type_df, on="JAN", how="left")
+
+    return store_count
+
+# ─────────────────────────────────────────────
+# 集計ヘルパー
+# ─────────────────────────────────────────────
+def aggregate(df: pd.DataFrame, group_cols: list, value_cols: list = None) -> pd.DataFrame:
+    if value_cols is None:
+        value_cols = ["売上金額", "売上金額_前期", "売上数量", "売上数量_前期", "POS客数", "ID客数"]
+    agg_dict = {c: "sum" for c in value_cols if c in df.columns}
+    g = df.groupby(group_cols, dropna=False).agg(agg_dict).reset_index()
+    if "売上金額" in g.columns and "売上金額_前期" in g.columns:
+        g["昨対比"] = (g["売上金額"] / g["売上金額_前期"].replace(0, np.nan)) * 100
+    return g
+
+def filter_months(df: pd.DataFrame, period: int, months: list) -> pd.DataFrame:
+    """指定期・指定月リストで絞り込む。複数月 = 合算表示。"""
+    return df[(df["期"] == period) & (df["期内月"].isin(months))]
+
+# ─────────────────────────────────────────────
+# サイドバー: ファイルアップロード
+# ─────────────────────────────────────────────
+with st.sidebar:
+    show_upload = st.toggle("📁 データアップロード", value=True, key="show_upload")
+    if show_upload:
+        idpos_file  = st.file_uploader("① IDPOS CSV", type=["csv"], key="idpos")
+        sri_file    = st.file_uploader("② SRI Excel (ヘッダー13行目〜)", type=["xlsx","xls"], key="sri")
+        master_file = st.file_uploader("③ マスタ CSV", type=["csv"], key="master")
+        if idpos_file: st.success("ファイルを受け付けました")
+    else:
+        idpos_file  = st.session_state.get("idpos")
+        sri_file    = st.session_state.get("sri")
+        master_file = st.session_state.get("master")
+
+st.title("📊 メンズビューティ販売分析ダッシュボード")
+
+if not idpos_file:
+    st.info("👈 サイドバーからIDPOS CSVをアップロードしてください")
+    st.stop()
+
+# ─────────────────────────────────────────────
+# データ読み込み
+# ─────────────────────────────────────────────
+with st.spinner("データ読み込み中..."):
+    df_all   = load_idpos(idpos_file)
+    df_sri   = load_sri(sri_file)    if sri_file    else None
+    df_mst   = load_master(master_file) if master_file else None
+
+# ─────────────────────────────────────────────
+# サイドバー: 期間・フィルタ設定
+# ─────────────────────────────────────────────
+# 列名解決
+def find_col(df, candidates):
+    for c in candidates:
+        if c in df.columns: return c
+    return None
+
+col_subcat = find_col(df_all, ["サブカテゴリー"])
+col_seg    = find_col(df_all, ["セグメント"])
+col_subseg = find_col(df_all, ["サブセグメント"])
+
+available_periods = sorted(df_all["期"].unique())
+available_months  = sorted(df_all["期内月"].unique())
+
+with st.sidebar:
+    st.markdown("---")
+    st.header("📅 期・絞り込み")
+
+    sel_period = st.selectbox(
+        "期", available_periods, index=len(available_periods)-1,
+        format_func=lambda p: f"{p}期（{p+1993}年7月〜{p+1994}年6月）"
+    )
+
+    st.markdown("---")
+    st.header("🔍 絞り込み")
+    st.caption("未選択＝全て表示　階層が連動します")
+
+    # 階層フィルタ: サブカテゴリー
+    df_filtered = df_all.copy()
+    if col_subcat:
+        all_subcats = sorted(df_all[col_subcat].dropna().unique())
+        sel_subcats = st.multiselect(
+            "① サブカテゴリー", all_subcats, default=[],
+            placeholder="すべて（未選択）",
+            key="filter_subcat",
+        )
+        if sel_subcats:
+            df_filtered = df_filtered[df_filtered[col_subcat].isin(sel_subcats)]
+    else:
+        sel_subcats = []
+
+    # セグメント（サブカテに連動）
+    if col_seg:
+        all_segs = sorted(df_filtered[col_seg].dropna().unique())
+        sel_segs = st.multiselect(
+            "② セグメント", all_segs, default=[],
+            placeholder="すべて（未選択）",
+            key="filter_seg",
+        )
+        if sel_segs:
+            df_filtered = df_filtered[df_filtered[col_seg].isin(sel_segs)]
+    else:
+        sel_segs = []
+
+    # サブセグメント（セグメントに連動）
+    if col_subseg:
+        all_subsegs = sorted(df_filtered[col_subseg].dropna().unique())
+        sel_subsegs = st.multiselect(
+            "③ サブセグメント", all_subsegs, default=[],
+            placeholder="すべて（未選択）",
+            key="filter_subseg",
+        )
+        if sel_subsegs:
+            df_filtered = df_filtered[df_filtered[col_subseg].isin(sel_subsegs)]
+    else:
+        sel_subsegs = []
+
+    # 絞り込み状況サマリー
+    filter_labels = []
+    if sel_subcats: filter_labels.append(f"サブカテ: {', '.join(sel_subcats)}")
+    if sel_segs:    filter_labels.append(f"セグ: {', '.join(sel_segs)}")
+    if sel_subsegs: filter_labels.append(f"サブセグ: {', '.join(sel_subsegs)}")
+    st.caption("絞り込みは全タブに反映されます")
+
+# ─────────────────────────────────────────────
+# メイン: 月選択UI（複数選択で自動累計）
+# ─────────────────────────────────────────────
+months_in_period = sorted(df_all[df_all["期"] == sel_period]["期内月"].unique())
+
+with st.container(border=True):
+    c_label, c_reset = st.columns([6, 1])
+    c_label.markdown("**月を選択** — 複数選択で合算（累計）表示")
+    if c_reset.button("リセット", key="month_reset", use_container_width=True):
+        st.session_state["month_pills"] = [max(months_in_period)]
+        st.rerun()
+    sel_months = st.pills(
+        "月番号",
+        options=months_in_period,
+        format_func=lambda m: MONTH_LABEL[m],
+        default=[max(months_in_period)],
+        selection_mode="multi",
+        key="month_pills",
+        label_visibility="collapsed",
+    )
+    if not sel_months:
+        sel_months = [max(months_in_period)]
+
+is_cumulative = len(sel_months) > 1
+sel_month = max(sel_months)
+
+if is_cumulative:
+    period_label = f"{sel_period}期 {MONTH_LABEL[min(sel_months)]}〜{MONTH_LABEL[sel_month]} 合算"
+else:
+    period_label = f"{sel_period}期 {MONTH_LABEL[sel_month]}"
+
+# ─────────────────────────────────────────────
+# 表示期間データ抽出（前期は同行の(前期)列を使用）
+# ─────────────────────────────────────────────
+df_cur = filter_months(df_filtered, sel_period, sel_months)
+
+# ─────────────────────────────────────────────
+# KPIカード（ヘッダー）
+# ─────────────────────────────────────────────
+total_sales    = df_cur["売上金額"].sum()
+total_prev     = df_cur["売上金額_前期"].sum() if "売上金額_前期" in df_cur.columns else 0
+total_qty      = df_cur["売上数量"].sum()
+total_qty_prev = df_cur["売上数量_前期"].sum() if "売上数量_前期" in df_cur.columns else 0
+total_pos      = df_cur["POS客数"].sum()
+total_pos_prev = df_cur["POS客数_前期"].sum() if "POS客数_前期" in df_cur.columns else 0
+total_id       = df_cur["ID客数"].sum()
+total_id_prev  = df_cur["ID客数_前期"].sum() if "ID客数_前期" in df_cur.columns else 0
+total_price    = total_sales / total_pos if total_pos > 0 else np.nan
+total_price_prev = total_prev / total_pos_prev if total_pos_prev > 0 else np.nan
+
+def yoy_ratio(cur, prev):
+    """昨対比（110.5% 形式）。前年なし → None。"""
+    if prev <= 0 or pd.isna(cur) or pd.isna(prev): return None
+    return cur / prev * 100
+
+def fmt_yoy_ratio(v):
+    return f"{v:.1f}%" if v is not None else "—"
+
+col1, col2, col3, col4, col5 = st.columns(5)
+for col, label, cur_v, prev_v in [
+    (col1, "売上金額（税抜）", total_sales,  total_prev),
+    (col2, "売上数量",         total_qty,    total_qty_prev),
+    (col3, "購買単価",         total_price,  total_price_prev),
+    (col4, "POS客数",          total_pos,    total_pos_prev),
+    (col5, "ID客数",           total_id,     total_id_prev),
+]:
+    ratio = yoy_ratio(cur_v, prev_v)
+    if label == "売上金額（税抜）":
+        val_str = fmt_yen(cur_v)
+    elif label == "購買単価":
+        val_str = fmt_yen(cur_v)
+    else:
+        val_str = f"{cur_v:,.0f}"
+    col.metric(label, val_str)
+    col.caption(f"昨対比 **{fmt_yoy_ratio(ratio)}**")
+filter_summary = "　".join(filter_labels) if filter_labels else "絞り込みなし（全て）"
+st.caption(f"表示期間: {period_label}　　絞り込み: {filter_summary}")
+
+st.markdown("---")
+
+# ─────────────────────────────────────────────
+# タブ
+# ─────────────────────────────────────────────
+tab_seg, tab_subseg, tab_trend, tab_rank, tab_teiban = st.tabs(
+    ["📋 セグメント別", "🔬 サブセグメント別", "📈 月別トレンド", "🏆 単品ランキング", "🏪 定番分析"]
+)
+
+# ═══════════════════════════════════════════════
+# Tab1: セグメント別（PowerPシートイメージ）
+# ═══════════════════════════════════════════════
+with tab_seg:
+    st.subheader(f"セグメント別サマリー — {period_label}")
+
+    group_cols = [c for c in [col_subcat, col_seg] if c]
+    if not group_cols:
+        st.warning("サブカテゴリー/セグメント列が見つかりません")
+    else:
+        # aggregate は売上金額_前期も集計し昨対比を自動計算
+        agg = aggregate(df_cur, group_cols)
+        # 列名を統一（前期売上 → 売上金額_前期）
+        if "売上金額_前期" in agg.columns:
+            agg = agg.rename(columns={"売上金額_前期": "前期売上"})
+
+        # SRI市場シェア
+        if df_sri is not None and col_subcat:
+            jan_seg = df_cur[["JAN", col_subcat, col_seg] if col_seg else ["JAN", col_subcat]].drop_duplicates("JAN")
+            jan_sales = df_cur.groupby("JAN")["売上金額"].sum().reset_index()
+            jan_sales = jan_sales.merge(df_sri[["JAN","市場規模_今期"]], on="JAN", how="left")
+            jan_sales = jan_sales.merge(jan_seg, on="JAN", how="left")
+            jan_sales["市場規模_今期"] = pd.to_numeric(jan_sales["市場規模_今期"], errors="coerce")
+            sri_agg = jan_sales.groupby(group_cols).agg(
+                IDPOS売上=("売上金額","sum"), 市場規模=("市場規模_今期","sum")
+            ).reset_index()
+            sri_agg["市場シェア(%)"] = (sri_agg["IDPOS売上"] / sri_agg["市場規模"] * 100).round(2)
+            agg = agg.merge(sri_agg[group_cols + ["市場シェア(%)"]], on=group_cols, how="left")
+
+        # 表示列
+        show = [c for c in agg.columns if c in group_cols + ["売上金額","前期売上","昨対比","売上数量","POS客数","ID客数","市場シェア(%)"]]
+        fmt = {
+            "売上金額":   "¥{:,.0f}",
+            "前期売上":   "¥{:,.0f}",
+            "昨対比":     "{:.1f}%",
+            "売上数量":   "{:,.0f}",
+            "POS客数":    "{:,.0f}",
+            "ID客数":     "{:,.0f}",
+            "市場シェア(%)": "{:.2f}%",
+        }
+        fmt_use = {k: v for k, v in fmt.items() if k in show}
+
+        # サブカテゴリー小計行を差し込む
+        if col_subcat and col_seg:
+            subtotals = (
+                agg.groupby(col_subcat, as_index=False)
+                .agg({c: "sum" for c in ["売上金額","前期売上","売上数量","POS客数","ID客数"] if c in agg.columns})
+            )
+            if "売上金額" in subtotals.columns and "前期売上" in subtotals.columns:
+                subtotals["昨対比"] = (subtotals["売上金額"] / subtotals["前期売上"].replace(0, np.nan) ) * 100
+            subtotals[col_seg] = "【小計】"
+            subtotals = subtotals.reindex(columns=agg.columns)
+            combined = pd.concat([agg, subtotals]).sort_values([col_subcat, col_seg]).reset_index(drop=True)
+        else:
+            combined = agg.reset_index(drop=True)
+
+        display_df = combined[show].reset_index(drop=True)
+
+        # 小計行のインデックスを特定してハイライト
+        if col_seg in display_df.columns:
+            is_subtotal = display_df[col_seg].astype(str) == "【小計】"
+
+            def highlight_subtotal(df):
+                styles = pd.DataFrame("", index=df.index, columns=df.columns)
+                styles.loc[is_subtotal] = "background-color:#fff3cd; font-weight:bold"
+                return styles
+
+            st.dataframe(
+                display_df.style
+                .format(fmt_use, na_rep="—")
+                .apply(highlight_subtotal, axis=None),
+                use_container_width=True, hide_index=True
+            )
+        else:
+            st.dataframe(
+                display_df.style.format(fmt_use, na_rep="—"),
+                use_container_width=True, hide_index=True
+            )
+
+        # ウォーターフォール風棒グラフ
+        fig = px.bar(
+            agg.sort_values("売上金額", ascending=False),
+            x="売上金額", y=col_seg if col_seg else col_subcat,
+            color=col_subcat if col_subcat else col_seg,
+            orientation="h",
+            title="セグメント別売上",
+            text_auto=".3s",
+        )
+        fig.update_yaxes(categoryorder="total ascending")
+        fig.update_layout(height=max(400, len(agg)*28), legend=dict(orientation="h", y=-0.2))
+        st.plotly_chart(fig, use_container_width=True)
+
+        # 昨対比ヒートマップ
+        if col_subcat and col_seg and "昨対比" in agg.columns:
+            pivot = agg.pivot_table(index=col_subcat, columns=col_seg, values="昨対比")
+            if not pivot.empty:
+                fig2 = px.imshow(
+                    pivot, text_auto=".1f", aspect="auto",
+                    color_continuous_scale=["#d62728","#ffffff","#2ca02c"],
+                    color_continuous_midpoint=100,
+                    title="昨対比ヒートマップ（%）",
+                )
+                st.plotly_chart(fig2, use_container_width=True)
+
+
+# ═══════════════════════════════════════════════
+# Tab2: サブセグメント別
+# ═══════════════════════════════════════════════
+with tab_subseg:
+    st.subheader(f"サブセグメント別詳細 — {period_label}")
+
+    if not col_subseg:
+        st.info("サブセグメント列が見つかりません")
+    else:
+        grp = [c for c in [col_subcat, col_seg, col_subseg] if c]
+        agg_ss = aggregate(
+            df_cur, grp,
+            value_cols=["売上金額","売上金額_前期","売上数量","売上数量_前期",
+                        "POS客数","POS客数_前期","ID客数","ID客数_前期"],
+        )
+
+        # 購買単価・前期購買単価
+        if "POS客数" in agg_ss.columns:
+            agg_ss["購買単価"] = agg_ss["売上金額"] / agg_ss["POS客数"].replace(0, np.nan)
+        if "POS客数_前期" in agg_ss.columns:
+            agg_ss["前期購買単価"] = (
+                agg_ss.get("売上金額_前期", pd.Series(np.nan, index=agg_ss.index))
+                / agg_ss["POS客数_前期"].replace(0, np.nan)
+            )
+
+        # 昨対比4指標
+        def safe_yoy(cur_col, prev_col, df):
+            if cur_col in df.columns and prev_col in df.columns:
+                return (df[cur_col] / df[prev_col].replace(0, np.nan) * 100)
+            return pd.Series(np.nan, index=df.index)
+
+        agg_ss["金額昨対"]  = safe_yoy("売上金額",   "売上金額_前期",   agg_ss)
+        agg_ss["数量昨対"]  = safe_yoy("売上数量",   "売上数量_前期",   agg_ss)
+        agg_ss["単価昨対"]  = safe_yoy("購買単価",   "前期購買単価",    agg_ss)
+        agg_ss["POS昨対"]   = safe_yoy("POS客数",    "POS客数_前期",    agg_ss)
+
+        if "ID客数" in agg_ss.columns and "POS客数" in agg_ss.columns:
+            agg_ss["ID率(%)"] = agg_ss["ID客数"] / agg_ss["POS客数"].replace(0, np.nan) * 100
+
+        show_cols = grp + [c for c in [
+            "売上金額","金額昨対",
+            "売上数量","数量昨対",
+            "購買単価","単価昨対",
+            "POS客数","POS昨対",
+            "ID率(%)",
+        ] if c in agg_ss.columns]
+        fmt2 = {
+            "売上金額":  "¥{:,.0f}",
+            "金額昨対":  "{:.1f}%",
+            "売上数量":  "{:,.0f}",
+            "数量昨対":  "{:.1f}%",
+            "購買単価":  "¥{:,.0f}",
+            "単価昨対":  "{:.1f}%",
+            "POS客数":   "{:,.0f}",
+            "POS昨対":   "{:.1f}%",
+            "ID率(%)":   "{:.1f}%",
+        }
+
+        # 昨対比列を100%基準でカラースケール
+        def color_yoy_cols(df):
+            styles = pd.DataFrame("", index=df.index, columns=df.columns)
+            for col in ["金額昨対","数量昨対","単価昨対","POS昨対"]:
+                if col not in df.columns: continue
+                for idx, val in df[col].items():
+                    if pd.isna(val): continue
+                    if val >= 105:   styles.loc[idx, col] = "color:#1a7a1a; font-weight:bold"
+                    elif val >= 100: styles.loc[idx, col] = "color:#2ca02c"
+                    elif val >= 95:  styles.loc[idx, col] = "color:#ff7f0e"
+                    else:            styles.loc[idx, col] = "color:#d62728; font-weight:bold"
+            return styles
+
+        st.dataframe(
+            agg_ss[show_cols].sort_values("売上金額", ascending=False)
+            .style
+            .format({k: v for k, v in fmt2.items() if k in show_cols}, na_rep="—")
+            .apply(color_yoy_cols, axis=None),
+            use_container_width=True, hide_index=True
+        )
+
+        # バブルチャート: 金額昨対 × 売上金額
+        if "金額昨対" in agg_ss.columns:
+            fig = px.scatter(
+                agg_ss.dropna(subset=["金額昨対","売上金額"]),
+                x="金額昨対", y="売上金額",
+                size="売上数量" if "売上数量" in agg_ss.columns else None,
+                color=col_seg if col_seg else col_subcat,
+                hover_name=col_subseg,
+                labels={"金額昨対": "売上昨対比（%）"},
+                title="売上昨対比 × 売上金額（バブル＝売上数量）",
+            )
+            fig.add_vline(x=100, line_dash="dash", line_color="gray",
+                          annotation_text="前年同期", annotation_position="top right")
+            st.plotly_chart(fig, use_container_width=True)
+
+
+# ═══════════════════════════════════════════════
+# Tab3: 月別トレンド
+# ═══════════════════════════════════════════════
+with tab_trend:
+    st.subheader("月別トレンド — 46期 vs 47期")
+
+    trend_type = st.radio("表示タイプ", ["月次（単月）", "累計推移"], horizontal=True, key="trend_type")
+    trend_unit = st.radio(
+        "集計単位",
+        ["全体"] + ([col_subcat] if col_subcat else []) + ([col_seg] if col_seg else []),
+        horizontal=True, key="trend_unit"
+    )
+
+    def build_monthly(df_base, unit_col=None):
+        grp = ["期", "期内月"] + ([unit_col] if unit_col else [])
+        out = df_base.groupby(grp)["売上金額"].sum().reset_index()
+        if trend_type == "累計推移":
+            if unit_col:
+                out = out.sort_values(["期", unit_col, "期内月"])
+                out["売上金額_累計"] = out.groupby(["期", unit_col])["売上金額"].cumsum()
+            else:
+                out = out.sort_values(["期", "期内月"])
+                out["売上金額_累計"] = out.groupby("期")["売上金額"].cumsum()
+        return out
+
+    y_col = "売上金額_累計" if trend_type == "累計推移" else "売上金額"
+    y_label = "累計売上金額（円）" if trend_type == "累計推移" else "売上金額（円）"
+
+    if trend_unit == "全体":
+        tdf = build_monthly(df_filtered)
+        tdf["期ラベル"] = tdf["期"].astype(str) + "期"
+        tdf["月ラベル"] = tdf["期内月"].map(MONTH_LABEL)
+
+        fig = go.Figure()
+        colors = {46: "#1f77b4", 47: "#ff7f0e"}
+        for p in sorted(tdf["期"].unique()):
+            d = tdf[tdf["期"] == p].sort_values("期内月")
+            fig.add_trace(go.Scatter(
+                x=d["期内月"], y=d[y_col],
+                name=f"{p}期",
+                mode="lines+markers",
+                line=dict(color=colors.get(p,"#2ca02c"), width=3),
+                marker=dict(size=9),
+                customdata=d["月ラベル"],
+                hovertemplate="%{customdata}<br>¥%{y:,.0f}<extra>%{fullData.name}</extra>",
+            ))
+    else:
+        unit_col = trend_unit
+        items = sorted(df_filtered[unit_col].dropna().unique())
+        sel_items = st.multiselect(f"{unit_col}を選択", items, default=items[:6], key="trend_items")
+        tdf = build_monthly(df_filtered[df_filtered[unit_col].isin(sel_items)], unit_col)
+
+        palette = px.colors.qualitative.Set2
+        fig = go.Figure()
+        for i, item in enumerate(sel_items):
+            for p in sorted(tdf["期"].unique()):
+                d = tdf[(tdf["期"]==p) & (tdf[unit_col]==item)].sort_values("期内月")
+                fig.add_trace(go.Scatter(
+                    x=d["期内月"], y=d[y_col],
+                    name=f"{item} / {p}期",
+                    mode="lines+markers",
+                    line=dict(color=palette[i % len(palette)],
+                              dash="solid" if p == sel_period else "dot", width=2),
+                ))
+
+    fig.update_layout(
+        title=f"{'累計' if trend_type=='累計推移' else '月次'}売上推移（46期 vs 47期）",
+        xaxis=dict(title="期内月", tickvals=list(range(1,13)),
+                   ticktext=[MONTH_LABEL[m] for m in range(1,13)]),
+        yaxis=dict(title=y_label),
+        hovermode="x unified",
+        legend=dict(orientation="h", y=-0.25),
+    )
+    # 選択月に縦線
+    fig.add_vline(x=sel_month, line_dash="dash", line_color="red",
+                  annotation_text=f"▶ {MONTH_LABEL[sel_month]}", annotation_position="top right")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # 昨対比バーチャート（47期の前期列を使用）
+    st.markdown("#### 月別昨対比（47期 vs 前年同月）")
+    df47 = df_filtered[df_filtered["期"] == sel_period]
+    if "売上金額_前期" in df47.columns:
+        monthly_cur  = df47.groupby("期内月")["売上金額"].sum()
+        monthly_prev = df47.groupby("期内月")["売上金額_前期"].sum()
+    else:
+        monthly_cur  = df47.groupby("期内月")["売上金額"].sum()
+        monthly_prev = df_filtered[df_filtered["期"]==sel_period-1].groupby("期内月")["売上金額"].sum()
+    if trend_type == "累計推移":
+        monthly_cur  = monthly_cur.sort_index().cumsum()
+        monthly_prev = monthly_prev.sort_index().cumsum()
+    yoy_s = ((monthly_cur / monthly_prev.replace(0, np.nan)) * 100).reset_index()
+    yoy_s.columns = ["期内月", "昨対比(%)"]
+    yoy_s["月"] = yoy_s["期内月"].map(MONTH_LABEL)
+    fig2 = px.bar(
+        yoy_s, x="月", y="昨対比(%)",
+        color="昨対比(%)",
+        color_continuous_scale=["#d62728","#ffffff","#2ca02c"],
+        color_continuous_midpoint=100,
+        title="昨対比（%）　100%=前年同期並み",
+        text_auto=".1f",
+    )
+    fig2.add_hline(y=100, line_color="black", line_width=1, line_dash="dash")
+    fig2.update_layout(coloraxis_showscale=False, xaxis_title="",
+                       yaxis=dict(ticksuffix="%"))
+    st.plotly_chart(fig2, use_container_width=True)
+
+
+# ═══════════════════════════════════════════════
+# Tab4: 単品ランキング（単品Rシートイメージ）
+# ═══════════════════════════════════════════════
+with tab_rank:
+    st.subheader(f"単品ランキング — {period_label}")
+
+    c1, c2, c3 = st.columns(3)
+    rank_by   = c1.radio("ランキング基準", ["売上金額","売上数量","ID客数"], horizontal=True, key="rank_by")
+    top_n     = c2.select_slider("表示件数", [10,20,30,50,100], value=30, key="top_n")
+    show_prev = c3.checkbox("前年比較を表示", value=True)
+
+    jan_agg = df_cur.groupby("JAN").agg(
+        商品名   =("商品名","first"),
+        メーカー  =("メーカー","first") if "メーカー" in df_cur.columns else ("JAN","first"),
+        **({col_subcat: (col_subcat,"first")} if col_subcat else {}),
+        **({col_seg:    (col_seg,   "first")} if col_seg    else {}),
+        売上金額  =("売上金額","sum"),
+        売上数量  =("売上数量","sum"),
+        POS客数   =("POS客数", "sum"),
+        ID客数    =("ID客数",  "sum"),
+    ).reset_index()
+
+    # 前期列はCSV内の(前期)列を使用
+    jan_prev = df_cur.groupby("JAN").agg(
+        前期売上金額=("売上金額_前期","sum"),
+        前期売上数量=("売上数量_前期","sum"),
+    ).reset_index() if "売上金額_前期" in df_cur.columns else pd.DataFrame()
+
+    if show_prev and not jan_prev.empty:
+        jan_agg = jan_agg.merge(jan_prev, on="JAN", how="left")
+        jan_agg["昨対比"]   = (jan_agg["売上金額"] / jan_agg["前期売上金額"].replace(0,np.nan)) * 100
+        jan_agg["数量昨対"] = (jan_agg["売上数量"] / jan_agg["前期売上数量"].replace(0,np.nan)) * 100
+
+    jan_agg["単価"] = jan_agg["売上金額"] / jan_agg["売上数量"].replace(0, np.nan)
+
+    if df_mst is not None:
+        jan_agg = jan_agg.merge(df_mst[["JAN","採用店舗数"]], on="JAN", how="left")
+
+    jan_agg = jan_agg.sort_values(rank_by, ascending=False).head(top_n).reset_index(drop=True)
+    jan_agg.insert(0, "順位", range(1, len(jan_agg)+1))
+
+    # 表示列構築
+    base_cols = ["順位","JAN","商品名"]
+    if col_subcat and col_subcat in jan_agg.columns: base_cols.append(col_subcat)
+    if col_seg    and col_seg    in jan_agg.columns: base_cols.append(col_seg)
+    base_cols += ["売上金額","売上数量","単価"]
+    if show_prev and "前期売上金額" in jan_agg.columns:
+        base_cols += ["前期売上金額","昨対比","数量昨対"]
+    if "採用店舗数" in jan_agg.columns: base_cols.append("採用店舗数")
+
+    base_cols = [c for c in base_cols if c in jan_agg.columns]
+    fmt_r = {
+        "売上金額":"¥{:,.0f}","前期売上金額":"¥{:,.0f}","売上数量":"{:,.0f}",
+        "単価":"¥{:,.0f}","昨対比":"{:.1f}%","数量昨対":"{:.1f}%","採用店舗数":"{:.0f}",
+    }
+    st.dataframe(
+        jan_agg[base_cols].style.format({k:v for k,v in fmt_r.items() if k in base_cols}, na_rep="—"),
+        use_container_width=True, hide_index=True, height=600,
+    )
+
+    # 横棒グラフ
+    fig = px.bar(
+        jan_agg,
+        x=rank_by, y="商品名",
+        orientation="h",
+        color=col_seg if col_seg and col_seg in jan_agg.columns else (col_subcat if col_subcat else None),
+        hover_data=["JAN","メーカー"] if "メーカー" in jan_agg.columns else ["JAN"],
+        title=f"TOP{top_n} 単品ランキング（{rank_by}）",
+        text_auto=".3s",
+    )
+    fig.update_yaxes(categoryorder="total ascending")
+    fig.update_layout(height=max(500, top_n * 24), legend=dict(orientation="h", y=-0.15))
+    st.plotly_chart(fig, use_container_width=True)
+
+
+# ═══════════════════════════════════════════════
+# Tab5: 定番分析（採用店舗数×平均売上）
+# ═══════════════════════════════════════════════
+with tab_teiban:
+    st.subheader(f"定番分析 — {period_label}")
+
+    if df_mst is None:
+        st.warning("マスタCSVをアップロードすると定番分析が表示されます")
+    else:
+        jan_sales = df_cur.groupby("JAN").agg(
+            商品名  =("商品名","first"),
+            **({col_subcat: (col_subcat,"first")} if col_subcat else {}),
+            **({col_seg:    (col_seg,   "first")} if col_seg    else {}),
+            売上金額 =("売上金額","sum"),
+            売上数量 =("売上数量","sum"),
+        ).reset_index()
+
+        jan_sales = jan_sales.merge(df_mst, on="JAN", how="left")
+        jan_sales["採用店舗数"] = pd.to_numeric(jan_sales["採用店舗数"], errors="coerce")
+        jan_sales["1店舗あたり売上"] = jan_sales["売上金額"] / jan_sales["採用店舗数"].replace(0, np.nan)
+
+        has_yoy = "売上金額_前期" in df_cur.columns
+        if has_yoy:
+            prev_jan = df_cur.groupby("JAN")["売上金額_前期"].sum().reset_index().rename(columns={"売上金額_前期":"前期売上"})
+            jan_sales = jan_sales.merge(prev_jan, on="JAN", how="left")
+            jan_sales["昨対比"] = (jan_sales["売上金額"] / jan_sales["前期売上"].replace(0, np.nan)) * 100
+
+        # ── 象限分類（採用店舗数 × 昨対比） ──────────────────
+        med_store = jan_sales["採用店舗数"].median()
+
+        if has_yoy:
+            def classify_quad(r):
+                growing = r["昨対比"] >= 100 if not pd.isna(r["昨対比"]) else False
+                wide    = r["採用店舗数"] >= med_store if not pd.isna(r["採用店舗数"]) else False
+                if   wide and growing:  return "🚀 主力成長"
+                elif wide and not growing: return "⚠️ 主力低迷"
+                elif not wide and growing: return "📈 伸び盛り"
+                else:                      return "❌ 課題商品"
+            jan_sales["象限"] = jan_sales.apply(classify_quad, axis=1)
+
+            QUAD_COLOR = {
+                "🚀 主力成長": "#2ca02c",
+                "📈 伸び盛り": "#98df8a",
+                "⚠️ 主力低迷": "#ff7f0e",
+                "❌ 課題商品": "#d62728",
+            }
+            QUAD_ORDER = ["🚀 主力成長", "📈 伸び盛り", "⚠️ 主力低迷", "❌ 課題商品"]
+
+            plot_df = jan_sales.dropna(subset=["採用店舗数","昨対比"]).copy()
+            plot_df["昨対比_表示"] = plot_df["昨対比"].map(lambda v: f"{v:.1f}%")
+
+            fig = px.scatter(
+                plot_df,
+                x="採用店舗数",
+                y="昨対比",
+                size="売上金額",
+                color="象限",
+                color_discrete_map=QUAD_COLOR,
+                category_orders={"象限": QUAD_ORDER},
+                hover_name="商品名",
+                hover_data={
+                    "JAN": True,
+                    "売上金額": ":,.0f",
+                    "昨対比_表示": True,
+                    "採用店舗数": ":.0f",
+                    "昨対比": False,
+                },
+                title="成長マトリクス：採用店舗数 × 昨対比（バブル＝売上金額）",
+                size_max=55,
+            )
+            # 基準線
+            fig.add_vline(x=med_store, line_dash="dash", line_color="#888",
+                          annotation_text=f"採用中央値 {med_store:.0f}店",
+                          annotation_position="top right",
+                          annotation_font_color="#888")
+            fig.add_hline(y=100, line_dash="dash", line_color="#888",
+                          annotation_text="前年同期 100%",
+                          annotation_position="bottom right",
+                          annotation_font_color="#888")
+
+            # 象限ラベル
+            x_max = plot_df["採用店舗数"].quantile(0.97)
+            y_min = plot_df["昨対比"].quantile(0.03)
+            y_max = plot_df["昨対比"].quantile(0.97)
+            for txt, x, y, color in [
+                ("🚀 主力成長\n採用広×伸びている",  x_max*0.88, y_max*0.92, "#2ca02c"),
+                ("⚠️ 主力低迷\n採用広×伸び悩み",   x_max*0.88, max(y_min*1.1, 80),   "#ff7f0e"),
+                ("📈 伸び盛り\n採用拡大チャンス",    med_store*0.15, y_max*0.92, "#1a7a1a"),
+                ("❌ 課題商品\n要見直し",             med_store*0.15, max(y_min*1.1, 80), "#d62728"),
+            ]:
+                fig.add_annotation(x=x, y=y, text=txt, showarrow=False,
+                                   font=dict(size=9, color=color), opacity=0.55)
+
+            fig.update_layout(
+                height=620,
+                yaxis=dict(title="昨対比（%）", ticksuffix="%"),
+                xaxis_title="採用店舗数",
+                legend=dict(title="象限", orientation="h", y=-0.15),
+            )
+        else:
+            # 昨対比がない場合は採用店舗数×1店舗あたり売上の旧チャート
+            med_y = jan_sales["1店舗あたり売上"].median()
+            fig = px.scatter(
+                jan_sales.dropna(subset=["採用店舗数","1店舗あたり売上"]),
+                x="採用店舗数", y="1店舗あたり売上",
+                size="売上金額",
+                color=col_seg if col_seg else col_subcat,
+                hover_name="商品名",
+                hover_data=["JAN","売上金額"],
+                title="定番分析：採用店舗数 × 1店舗あたり売上",
+                size_max=50,
+            )
+            fig.add_vline(x=med_store, line_dash="dash", line_color="gray")
+            fig.add_hline(y=med_y,     line_dash="dash", line_color="gray")
+            fig.update_layout(height=600)
+
+            jan_sales["象限"] = jan_sales.apply(lambda r: (
+                "🚀 主力成長" if r["採用店舗数"] >= med_store and r["1店舗あたり売上"] >= med_y
+                else "⚠️ 主力低迷" if r["採用店舗数"] >= med_store
+                else "📈 伸び盛り" if r["1店舗あたり売上"] >= med_y
+                else "❌ 課題商品"
+            ), axis=1)
+
+        st.plotly_chart(fig, use_container_width=True)
+        st.markdown("---")
+
+        # 象限サマリー＋詳細テーブル
+        QUAD_ORDER_SAFE = ["🚀 主力成長","📈 伸び盛り","⚠️ 主力低迷","❌ 課題商品"]
+        quad_sum = (jan_sales.groupby("象限")["売上金額"]
+                    .agg(["count","sum"]).reset_index()
+                    .rename(columns={"count":"品目数","sum":"売上合計"}))
+        quad_sum["象限_order"] = quad_sum["象限"].map({q:i for i,q in enumerate(QUAD_ORDER_SAFE)})
+        quad_sum = quad_sum.sort_values("象限_order").drop("象限_order", axis=1)
+
+        c_a, c_b = st.columns([1, 2])
+        with c_a:
+            st.markdown("**象限別サマリー**")
+            st.dataframe(
+                quad_sum.style.format({"売上合計":"¥{:,.0f}","品目数":"{:.0f}"}),
+                use_container_width=True, hide_index=True,
+            )
+        with c_b:
+            st.markdown("**商品一覧（売上順）**")
+            show_t = ["JAN","商品名","採用店舗数","売上金額","1店舗あたり売上","象限"]
+            if has_yoy: show_t.insert(5, "昨対比")
+            if col_seg and col_seg in jan_sales.columns: show_t.insert(2, col_seg)
+            show_t = [c for c in show_t if c in jan_sales.columns]
+            fmt_t = {
+                "売上金額":"¥{:,.0f}","1店舗あたり売上":"¥{:,.0f}",
+                "採用店舗数":"{:.0f}","昨対比":"{:.1f}%",
+            }
+
+            def color_quad_row(df):
+                colors = {"🚀 主力成長":"#e8f5e9","📈 伸び盛り":"#f1f8e9",
+                          "⚠️ 主力低迷":"#fff3e0","❌ 課題商品":"#ffebee"}
+                styles = pd.DataFrame("", index=df.index, columns=df.columns)
+                if "象限" in df.columns:
+                    for q, c in colors.items():
+                        styles.loc[df["象限"] == q] = f"background-color:{c}"
+                return styles
+
+            st.dataframe(
+                jan_sales[show_t].sort_values("売上金額", ascending=False)
+                .style
+                .format({k:v for k,v in fmt_t.items() if k in show_t}, na_rep="—")
+                .apply(color_quad_row, axis=None),
+                use_container_width=True, hide_index=True, height=420,
+            )
+
+# ─────────────────────────────────────────────
+st.markdown("---")
+st.caption(f"IDPOS: {len(df_all):,}件 | 絞り込み後: {len(df_filtered):,}件 | 表示: {len(df_cur):,}件")
