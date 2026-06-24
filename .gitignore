@@ -8,6 +8,9 @@ __pycache__/
 *.xlsx
 *.xls
 
+# TRマスタキャッシュ（ローカル保存・業務データ含むため除外）
+.trmaster_cache.parquet
+
 # ログ
 *.log
 
