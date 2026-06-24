@@ -398,8 +398,10 @@ total_pos      = df_cur["POS客数"].sum()
 total_pos_prev = df_cur["POS客数_前期"].sum() if "POS客数_前期" in df_cur.columns else 0
 total_id       = df_cur["ID客数"].sum()
 total_id_prev  = df_cur["ID客数_前期"].sum() if "ID客数_前期" in df_cur.columns else 0
-total_price    = total_sales / total_pos if total_pos > 0 else np.nan
-total_price_prev = total_prev / total_pos_prev if total_pos_prev > 0 else np.nan
+total_price      = total_sales / total_pos  if total_pos  > 0 else np.nan
+total_price_prev = total_prev  / total_pos_prev if total_pos_prev > 0 else np.nan
+total_avg_price      = total_sales / total_qty      if total_qty      > 0 else np.nan
+total_avg_price_prev = total_prev  / total_qty_prev if total_qty_prev > 0 else np.nan
 
 def yoy_ratio(cur, prev):
     """昨対比（110.5% 形式）。前年なし → None。"""
@@ -409,21 +411,17 @@ def yoy_ratio(cur, prev):
 def fmt_yoy_ratio(v):
     return f"{v:.1f}%" if v is not None else "—"
 
-col1, col2, col3, col4, col5 = st.columns(5)
+col1, col2, col3, col4, col5, col6 = st.columns(6)
 for col, label, cur_v, prev_v in [
-    (col1, "売上金額（税抜）", total_sales,  total_prev),
-    (col2, "売上数量",         total_qty,    total_qty_prev),
-    (col3, "購買単価",         total_price,  total_price_prev),
-    (col4, "POS客数",          total_pos,    total_pos_prev),
-    (col5, "ID客数",           total_id,     total_id_prev),
+    (col1, "売上金額（税抜）", total_sales,       total_prev),
+    (col2, "売上数量",         total_qty,         total_qty_prev),
+    (col3, "平均単価",         total_avg_price,   total_avg_price_prev),
+    (col4, "購買単価",         total_price,       total_price_prev),
+    (col5, "POS客数",          total_pos,         total_pos_prev),
+    (col6, "ID客数",           total_id,          total_id_prev),
 ]:
     ratio = yoy_ratio(cur_v, prev_v)
-    if label == "売上金額（税抜）":
-        val_str = fmt_yen(cur_v)
-    elif label == "購買単価":
-        val_str = fmt_yen(cur_v)
-    else:
-        val_str = f"{cur_v:,.0f}"
+    val_str = fmt_yen(cur_v) if label in ("売上金額（税抜）", "平均単価", "購買単価") else f"{cur_v:,.0f}"
     col.metric(label, val_str)
     col.caption(f"昨対比 **{fmt_yoy_ratio(ratio)}**")
 filter_summary = "　".join(filter_labels) if filter_labels else "絞り込みなし（全て）"
@@ -454,6 +452,12 @@ with tab_seg:
         if "売上金額_前期" in agg.columns:
             agg = agg.rename(columns={"売上金額_前期": "前期売上"})
 
+        # 平均単価（金額÷数量）と昨対比
+        agg["平均単価"] = agg["売上金額"] / agg["売上数量"].replace(0, np.nan)
+        if "前期売上" in agg.columns and "売上数量_前期" in agg.columns:
+            agg["前期平均単価"] = agg["前期売上"] / agg["売上数量_前期"].replace(0, np.nan)
+            agg["平均単価昨対"] = agg["平均単価"] / agg["前期平均単価"].replace(0, np.nan) * 100
+
         # 市場データ（SRI × TRマスタ）
         mrk = compute_market(df_sri, df_trmaster, group_cols,
                              col_subcat, col_seg, col_subseg,
@@ -464,7 +468,8 @@ with tab_seg:
 
         # 表示列
         show = [c for c in agg.columns if c in group_cols + [
-            "売上金額","前期売上","昨対比","市場前年比","昨対GAP","売上数量","POS客数","ID客数"]]
+            "売上金額","前期売上","昨対比","市場前年比","昨対GAP",
+            "売上数量","平均単価","平均単価昨対","POS客数","ID客数"]]
         fmt = {
             "売上金額":    "¥{:,.0f}",
             "前期売上":    "¥{:,.0f}",
@@ -472,17 +477,23 @@ with tab_seg:
             "市場前年比":  "{:.1f}%",
             "昨対GAP":     "{:+.1f}pp",
             "売上数量":    "{:,.0f}",
+            "平均単価":    "¥{:,.0f}",
+            "平均単価昨対": "{:.1f}%",
             "POS客数":     "{:,.0f}",
             "ID客数":      "{:,.0f}",
         }
         fmt_use = {k: v for k, v in fmt.items() if k in show}
 
         # サブカテゴリー小計行を差し込む
-        sum_cols = [c for c in ["売上金額","前期売上","売上数量","POS客数","ID客数"] if c in agg.columns]
+        sum_cols = [c for c in ["売上金額","前期売上","売上数量","売上数量_前期","POS客数","ID客数"] if c in agg.columns]
         if col_subcat and col_seg:
             subtotals = agg.groupby(col_subcat, as_index=False).agg({c: "sum" for c in sum_cols})
             if "売上金額" in subtotals.columns and "前期売上" in subtotals.columns:
                 subtotals["昨対比"] = subtotals["売上金額"] / subtotals["前期売上"].replace(0, np.nan) * 100
+            subtotals["平均単価"] = subtotals["売上金額"] / subtotals["売上数量"].replace(0, np.nan)
+            if "前期売上" in subtotals.columns and "売上数量_前期" in subtotals.columns:
+                subtotals["前期平均単価"] = subtotals["前期売上"] / subtotals["売上数量_前期"].replace(0, np.nan)
+                subtotals["平均単価昨対"] = subtotals["平均単価"] / subtotals["前期平均単価"].replace(0, np.nan) * 100
             # 市場小計は按分せず再集計
             if mrk is not None:
                 mrk_sub = (mrk.groupby(col_subcat)[["市場前年比"]].mean()
@@ -582,6 +593,12 @@ with tab_subseg:
         agg_ss["単価昨対"]  = safe_yoy("購買単価",   "前期購買単価",    agg_ss)
         agg_ss["POS昨対"]   = safe_yoy("POS客数",    "POS客数_前期",    agg_ss)
 
+        # 平均単価（金額÷数量）と昨対比
+        agg_ss["平均単価"] = agg_ss["売上金額"] / agg_ss["売上数量"].replace(0, np.nan)
+        if "売上金額_前期" in agg_ss.columns and "売上数量_前期" in agg_ss.columns:
+            agg_ss["前期平均単価"] = agg_ss["売上金額_前期"] / agg_ss["売上数量_前期"].replace(0, np.nan)
+            agg_ss["平均単価昨対"] = agg_ss["平均単価"] / agg_ss["前期平均単価"].replace(0, np.nan) * 100
+
         if "ID客数" in agg_ss.columns and "POS客数" in agg_ss.columns:
             agg_ss["ID率(%)"] = agg_ss["ID客数"] / agg_ss["POS客数"].replace(0, np.nan) * 100
 
@@ -596,6 +613,7 @@ with tab_subseg:
         show_cols = grp + [c for c in [
             "売上金額","金額昨対","市場前年比","昨対GAP",
             "売上数量","数量昨対",
+            "平均単価","平均単価昨対",
             "購買単価","単価昨対",
             "POS客数","POS昨対",
             "ID率(%)",
@@ -607,6 +625,8 @@ with tab_subseg:
             "昨対GAP":    "{:+.1f}pp",
             "売上数量":   "{:,.0f}",
             "数量昨対":   "{:.1f}%",
+            "平均単価":   "¥{:,.0f}",
+            "平均単価昨対": "{:.1f}%",
             "購買単価":   "¥{:,.0f}",
             "単価昨対":   "{:.1f}%",
             "POS客数":    "{:,.0f}",
@@ -617,7 +637,7 @@ with tab_subseg:
         # 昨対比・GAP列のカラースケール
         def color_yoy_cols(df):
             styles = pd.DataFrame("", index=df.index, columns=df.columns)
-            for col in ["金額昨対","数量昨対","単価昨対","POS昨対"]:
+            for col in ["金額昨対","数量昨対","平均単価昨対","単価昨対","POS昨対"]:
                 if col not in df.columns: continue
                 for idx, val in df[col].items():
                     if pd.isna(val): continue
@@ -798,7 +818,10 @@ with tab_rank:
         jan_agg["昨対比"]   = (jan_agg["売上金額"] / jan_agg["前期売上金額"].replace(0,np.nan)) * 100
         jan_agg["数量昨対"] = (jan_agg["売上数量"] / jan_agg["前期売上数量"].replace(0,np.nan)) * 100
 
-    jan_agg["単価"] = jan_agg["売上金額"] / jan_agg["売上数量"].replace(0, np.nan)
+    jan_agg["平均単価"] = jan_agg["売上金額"] / jan_agg["売上数量"].replace(0, np.nan)
+    if show_prev and "前期売上金額" in jan_agg.columns and "前期売上数量" in jan_agg.columns:
+        jan_agg["前期平均単価"] = jan_agg["前期売上金額"] / jan_agg["前期売上数量"].replace(0, np.nan)
+        jan_agg["平均単価昨対"] = jan_agg["平均単価"] / jan_agg["前期平均単価"].replace(0, np.nan) * 100
 
     if df_mst is not None:
         jan_agg = jan_agg.merge(df_mst[["JAN","採用店舗数"]], on="JAN", how="left")
@@ -810,15 +833,16 @@ with tab_rank:
     base_cols = ["順位","JAN","商品名"]
     if col_subcat and col_subcat in jan_agg.columns: base_cols.append(col_subcat)
     if col_seg    and col_seg    in jan_agg.columns: base_cols.append(col_seg)
-    base_cols += ["売上金額","売上数量","単価"]
+    base_cols += ["売上金額","売上数量","平均単価"]
     if show_prev and "前期売上金額" in jan_agg.columns:
-        base_cols += ["前期売上金額","昨対比","数量昨対"]
+        base_cols += ["前期売上金額","昨対比","数量昨対","平均単価昨対"]
     if "採用店舗数" in jan_agg.columns: base_cols.append("採用店舗数")
 
     base_cols = [c for c in base_cols if c in jan_agg.columns]
     fmt_r = {
         "売上金額":"¥{:,.0f}","前期売上金額":"¥{:,.0f}","売上数量":"{:,.0f}",
-        "単価":"¥{:,.0f}","昨対比":"{:.1f}%","数量昨対":"{:.1f}%","採用店舗数":"{:.0f}",
+        "平均単価":"¥{:,.0f}","昨対比":"{:.1f}%","数量昨対":"{:.1f}%",
+        "平均単価昨対":"{:.1f}%","採用店舗数":"{:.0f}",
     }
     st.dataframe(
         jan_agg[base_cols].style.format({k:v for k,v in fmt_r.items() if k in base_cols}, na_rep="—"),
