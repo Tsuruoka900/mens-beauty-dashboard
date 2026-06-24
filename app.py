@@ -719,7 +719,7 @@ with tab_subseg:
                 size="売上数量" if "売上数量" in agg_ss.columns else None,
                 color=col_seg if col_seg else col_subcat,
                 hover_name=col_subseg,
-                labels={"金額昨対": "売上昨対比（%）"},
+                labels={"昨対比_plot": "昨対比（%）　※新規商品は0%表示"},
                 title="売上昨対比 × 売上金額（バブル＝売上数量）",
             )
             fig.add_vline(x=100, line_dash="dash", line_color="gray",
@@ -1009,13 +1009,15 @@ with tab_teiban:
             }
             QUAD_ORDER = ["🚀 主力成長", "📈 伸び盛り", "⚠️ 主力低迷", "❌ 課題商品", "🆕 新規商品"]
 
-            plot_df = jan_sales.dropna(subset=["採用店舗数","昨対比"]).copy()
-            plot_df["昨対比_表示"] = plot_df["昨対比"].map(lambda v: f"{v:.1f}%")
+            # 新規商品は昨対比NaNだがプロットする（y軸は0で表示）
+            plot_df = jan_sales.dropna(subset=["採用店舗数"]).copy()
+            plot_df["昨対比_plot"] = plot_df["昨対比"].fillna(0)
+            plot_df["昨対比_表示"] = plot_df["昨対比"].map(lambda v: f"{v:.1f}%" if pd.notna(v) else "新規")
 
             fig = px.scatter(
                 plot_df,
                 x="採用店舗数",
-                y="昨対比",
+                y="昨対比_plot",
                 size="売上金額",
                 color="象限",
                 color_discrete_map=QUAD_COLOR,
@@ -1027,6 +1029,7 @@ with tab_teiban:
                     "昨対比_表示": True,
                     "採用店舗数": ":.0f",
                     "昨対比": False,
+                    "昨対比_plot": False,
                 },
                 title="成長マトリクス：採用店舗数 × 昨対比（バブル＝売上金額）",
                 size_max=55,
@@ -1043,8 +1046,8 @@ with tab_teiban:
 
             # 象限ラベル
             x_max = plot_df["採用店舗数"].quantile(0.97)
-            y_min = plot_df["昨対比"].quantile(0.03)
-            y_max = plot_df["昨対比"].quantile(0.97)
+            y_min = plot_df["昨対比_plot"].quantile(0.03)
+            y_max = plot_df["昨対比_plot"].quantile(0.97)
             for txt, x, y, color in [
                 ("🚀 主力成長\n採用広×伸びている",  x_max*0.88, y_max*0.92, "#2ca02c"),
                 ("⚠️ 主力低迷\n採用広×伸び悩み",   x_max*0.88, max(y_min*1.1, 80),   "#ff7f0e"),
@@ -1056,7 +1059,7 @@ with tab_teiban:
 
             fig.update_layout(
                 height=620,
-                yaxis=dict(title="昨対比（%）", ticksuffix="%"),
+                yaxis=dict(title="昨対比（%）　※新規商品は0%表示", ticksuffix="%"),
                 xaxis_title="採用店舗数",
                 legend=dict(title="象限", orientation="h", y=-0.15),
             )
