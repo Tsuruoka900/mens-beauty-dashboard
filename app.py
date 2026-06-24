@@ -1149,30 +1149,49 @@ with tab_teiban:
                 use_container_width=True, hide_index=True,
             )
         with c_b:
-            st.markdown("**商品一覧（売上順）**")
-            show_t = ["JAN","商品名","採用店舗数","売上金額","1店舗あたり売上","象限"]
-            if has_yoy: show_t.insert(5, "昨対比")
-            if col_seg and col_seg in jan_sales.columns: show_t.insert(2, col_seg)
-            show_t = [c for c in show_t if c in jan_sales.columns]
+            cb_title, cb_input = st.columns([3, 1])
+            cb_title.markdown("**商品一覧（売上順）**")
+            total_stores = cb_input.number_input(
+                "全店舗数", min_value=1, value=383, step=1, key="total_stores",
+                label_visibility="visible",
+            )
+
+            jan_sales_disp = jan_sales.copy()
+            jan_sales_disp["採用率(%)"] = (
+                jan_sales_disp["採用店舗数"] / total_stores * 100
+            ).round(1)
+
+            show_t = ["JAN","商品名","採用店舗数","採用率(%)","売上金額","1店舗あたり売上","象限"]
+            if has_yoy: show_t.insert(6, "昨対比")
+            if col_seg and col_seg in jan_sales_disp.columns: show_t.insert(2, col_seg)
+            show_t = [c for c in show_t if c in jan_sales_disp.columns]
             fmt_t = {
                 "売上金額":"¥{:,.0f}","1店舗あたり売上":"¥{:,.0f}",
-                "採用店舗数":"{:.0f}","昨対比":"{:.1f}%",
+                "採用店舗数":"{:.0f}","採用率(%)":"{:.1f}%","昨対比":"{:.1f}%",
             }
 
-            def color_quad_row(df):
-                colors = {"🚀 主力成長":"#e8f5e9","📈 伸び盛り":"#f1f8e9",
-                          "⚠️ 主力低迷":"#fff3e0","❌ 課題商品":"#ffebee","🆕 新規商品":"#e3f2fd"}
+            def color_teiban_table(df):
                 styles = pd.DataFrame("", index=df.index, columns=df.columns)
+                # 行背景（象限色）
+                quad_colors = {"🚀 主力成長":"#e8f5e9","📈 伸び盛り":"#f1f8e9",
+                               "⚠️ 主力低迷":"#fff3e0","❌ 課題商品":"#ffebee","🆕 新規商品":"#e3f2fd"}
                 if "象限" in df.columns:
-                    for q, c in colors.items():
+                    for q, c in quad_colors.items():
                         styles.loc[df["象限"] == q] = f"background-color:{c}"
+                # 採用率セルだけ上書きで色付け
+                if "採用率(%)" in df.columns:
+                    for idx, val in df["採用率(%)"].items():
+                        if pd.isna(val): continue
+                        if val >= 80:   styles.loc[idx, "採用率(%)"] = "background-color:#c8e6c9; color:#1a7a1a; font-weight:bold"
+                        elif val >= 50: styles.loc[idx, "採用率(%)"] = "background-color:#fff9c4; color:#8a6d00; font-weight:bold"
+                        else:           styles.loc[idx, "採用率(%)"] = "background-color:#ffcdd2; color:#c62828; font-weight:bold"
                 return styles
 
             st.dataframe(
-                jan_sales[show_t].sort_values("売上金額", ascending=False)
+                jan_sales_disp[show_t].sort_values("売上金額", ascending=False)
                 .style
                 .format({k:v for k,v in fmt_t.items() if k in show_t}, na_rep="—")
-                .apply(color_quad_row, axis=None),
+                .apply(color_teiban_table, axis=None),
                 use_container_width=True, hide_index=True, height=420,
             )
 
