@@ -103,7 +103,7 @@ def load_sri(file) -> pd.DataFrame:
             qty_map[int(m2.group(1)) * 100 + int(m2.group(2))] = c
 
     # JAN が13桁数字の行だけ残す
-    raw["JAN"] = raw[jan_col].astype(str).str.strip().str.zfill(13)
+    raw["JAN"] = raw[jan_col].astype(str).str.strip().str.lstrip("0").str.zfill(13)
     df = raw[raw["JAN"].str.match(r'^\d{13}$')].copy()
 
     def to_num(s):
@@ -128,7 +128,7 @@ def load_trmaster(file) -> pd.DataFrame:
     """
     df = pd.read_excel(file, sheet_name="TRマスタ", header=0, dtype=str)
     df.columns = df.columns.str.strip()
-    df["JAN"] = df["JAN"].astype(str).str.zfill(13)
+    df["JAN"] = df["JAN"].astype(str).str.lstrip("0").str.zfill(13)
     keep = [c for c in ["JAN", "サブカテゴリー名", "セグメント名", "サブセグメント名"] if c in df.columns]
     return df[keep].drop_duplicates("JAN").reset_index(drop=True)
 
@@ -877,7 +877,8 @@ with tab_rank:
 
     # 市場前年比・昨対GAP（JAN単位でSRIデータと結合）
     if df_sri is not None:
-        jan_agg["JAN"] = jan_agg["JAN"].astype(str).str.zfill(13)
+        # IDPOSのJANは20桁ゼロ埋め → 末尾13桁がEANコード
+        jan_agg["JAN13"] = jan_agg["JAN"].astype(str).str.lstrip("0").str.zfill(13)
         today_yms_rank = [mip_to_yyyymm(sel_period,     m) for m in sel_months]
         prev_yms_rank  = [mip_to_yyyymm(sel_period - 1, m) for m in sel_months]
         sri_today = (df_sri[df_sri["YYYYMM"].isin(today_yms_rank)]
@@ -888,7 +889,8 @@ with tab_rank:
                      .rename(columns={"市場金額": "市場金額_前年"}))
         sri_jan = sri_today.merge(sri_prev, on="JAN", how="outer")
         sri_jan["市場前年比"] = sri_jan["市場金額_今期"] / sri_jan["市場金額_前年"].replace(0, np.nan) * 100
-        jan_agg = jan_agg.merge(sri_jan[["JAN","市場前年比"]], on="JAN", how="left")
+        jan_agg = jan_agg.merge(sri_jan[["JAN","市場前年比"]].rename(columns={"JAN":"JAN13"}), on="JAN13", how="left")
+        jan_agg = jan_agg.drop(columns=["JAN13"])
         if "昨対比" in jan_agg.columns:
             jan_agg["昨対GAP"] = jan_agg["昨対比"] - jan_agg["市場前年比"]
 
