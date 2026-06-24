@@ -557,17 +557,30 @@ with tab_seg:
             use_container_width=True, hide_index=True
         )
 
-        # ウォーターフォール風棒グラフ
+        # ウォーターフォール風棒グラフ（構成比ラベル付き）
+        total_for_share = agg["売上金額"].sum()
+        agg_plot = agg.sort_values("売上金額", ascending=False).copy()
+        agg_plot["構成比"] = agg_plot["売上金額"] / total_for_share * 100
+        agg_plot["ラベル"] = agg_plot.apply(
+            lambda r: f"{r['売上金額']/1e6:.1f}M  ({r['構成比']:.1f}%)", axis=1
+        )
+        y_col_plot = col_seg if col_seg else col_subcat
         fig = px.bar(
-            agg.sort_values("売上金額", ascending=False),
-            x="売上金額", y=col_seg if col_seg else col_subcat,
+            agg_plot,
+            x="売上金額", y=y_col_plot,
             color=col_subcat if col_subcat else col_seg,
             orientation="h",
-            title="セグメント別売上",
-            text_auto=".3s",
+            title="セグメント別売上（構成比）",
+            text="ラベル",
         )
+        fig.update_traces(textposition="outside", cliponaxis=False)
         fig.update_yaxes(categoryorder="total ascending")
-        fig.update_layout(height=max(400, len(agg)*28), legend=dict(orientation="h", y=-0.2))
+        fig.update_layout(
+            height=max(400, len(agg)*32),
+            legend=dict(orientation="h", y=-0.2),
+            xaxis=dict(title="売上金額（円）"),
+            uniformtext_minsize=9, uniformtext_mode="hide",
+        )
         st.plotly_chart(fig, use_container_width=True)
 
         # 昨対比ヒートマップ
