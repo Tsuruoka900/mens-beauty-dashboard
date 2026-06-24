@@ -217,6 +217,7 @@ def filter_months(df: pd.DataFrame, period: int, months: list) -> pd.DataFrame:
 # ─────────────────────────────────────────────
 import pathlib
 _TRMASTER_CACHE = pathlib.Path(__file__).parent / ".trmaster_cache.parquet"
+_MASTER_CACHE   = pathlib.Path(__file__).parent / ".master_cache.parquet"
 
 def save_trmaster(df: pd.DataFrame):
     df.to_parquet(_TRMASTER_CACHE, index=False)
@@ -224,6 +225,14 @@ def save_trmaster(df: pd.DataFrame):
 def load_trmaster_cache() -> pd.DataFrame | None:
     if _TRMASTER_CACHE.exists():
         return pd.read_parquet(_TRMASTER_CACHE)
+    return None
+
+def save_master(df: pd.DataFrame):
+    df.to_parquet(_MASTER_CACHE, index=False)
+
+def load_master_cache() -> pd.DataFrame | None:
+    if _MASTER_CACHE.exists():
+        return pd.read_parquet(_MASTER_CACHE)
     return None
 
 # ─────────────────────────────────────────────
@@ -234,7 +243,18 @@ with st.sidebar:
     if show_upload:
         idpos_file    = st.file_uploader("① IDPOS CSV", type=["csv"], key="idpos")
         sri_file      = st.file_uploader("② SRI Excel（2年分）", type=["xlsx","xls"], key="sri")
-        master_file   = st.file_uploader("③ マスタ CSV", type=["csv"], key="master")
+        master_file   = st.file_uploader(
+            "③ マスタ CSV（半期更新）", type=["csv"], key="master",
+            help="アップロードするとローカルに保存され、次回以降は不要です",
+        )
+        if master_file:
+            st.caption("✅ マスタを保存しました（次回以降は不要）")
+        elif _MASTER_CACHE.exists():
+            st.caption("💾 保存済みマスタを使用中")
+            if st.button("🗑️ マスタをリセット", key="master_reset"):
+                _MASTER_CACHE.unlink(missing_ok=True)
+                st.rerun()
+
         monthly_file  = st.file_uploader(
             "④ TRマスタ Excel（半期更新）",
             type=["xlsx","xls"], key="monthly",
@@ -266,7 +286,13 @@ if not idpos_file:
 with st.spinner("データ読み込み中..."):
     df_all = load_idpos(idpos_file)
     df_sri = load_sri(sri_file) if sri_file else None
-    df_mst = load_master(master_file) if master_file else None
+
+    # マスタCSV: 新規アップロード → 保存 → 以降はキャッシュから
+    if master_file:
+        df_mst = load_master(master_file)
+        save_master(df_mst)
+    else:
+        df_mst = load_master_cache()
 
     # TRマスタ: 新規アップロード → 保存 → 以降はキャッシュから
     if monthly_file:
