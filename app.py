@@ -989,12 +989,15 @@ with tab_teiban:
 
         if has_yoy:
             def classify_quad(r):
+                # 前期売上なし＝新規商品は別扱い
+                if pd.isna(r["前期売上"]) or r["前期売上"] <= 0:
+                    return "🆕 新規商品"
                 growing = r["昨対比"] >= 100 if not pd.isna(r["昨対比"]) else False
                 wide    = r["採用店舗数"] >= med_store if not pd.isna(r["採用店舗数"]) else False
-                if   wide and growing:  return "🚀 主力成長"
+                if   wide and growing:     return "🚀 主力成長"
                 elif wide and not growing: return "⚠️ 主力低迷"
                 elif not wide and growing: return "📈 伸び盛り"
-                else:                      return "❌ 課題商品"
+                else:                     return "❌ 課題商品"
             jan_sales["象限"] = jan_sales.apply(classify_quad, axis=1)
 
             QUAD_COLOR = {
@@ -1002,8 +1005,9 @@ with tab_teiban:
                 "📈 伸び盛り": "#98df8a",
                 "⚠️ 主力低迷": "#ff7f0e",
                 "❌ 課題商品": "#d62728",
+                "🆕 新規商品": "#1f77b4",
             }
-            QUAD_ORDER = ["🚀 主力成長", "📈 伸び盛り", "⚠️ 主力低迷", "❌ 課題商品"]
+            QUAD_ORDER = ["🚀 主力成長", "📈 伸び盛り", "⚠️ 主力低迷", "❌ 課題商品", "🆕 新規商品"]
 
             plot_df = jan_sales.dropna(subset=["採用店舗数","昨対比"]).copy()
             plot_df["昨対比_表示"] = plot_df["昨対比"].map(lambda v: f"{v:.1f}%")
@@ -1084,7 +1088,7 @@ with tab_teiban:
         st.markdown("---")
 
         # 象限サマリー＋詳細テーブル
-        QUAD_ORDER_SAFE = ["🚀 主力成長","📈 伸び盛り","⚠️ 主力低迷","❌ 課題商品"]
+        QUAD_ORDER_SAFE = ["🚀 主力成長","📈 伸び盛り","⚠️ 主力低迷","❌ 課題商品","🆕 新規商品"]
         quad_sum = (jan_sales.groupby("象限")["売上金額"]
                     .agg(["count","sum"]).reset_index()
                     .rename(columns={"count":"品目数","sum":"売上合計"}))
@@ -1111,7 +1115,7 @@ with tab_teiban:
 
             def color_quad_row(df):
                 colors = {"🚀 主力成長":"#e8f5e9","📈 伸び盛り":"#f1f8e9",
-                          "⚠️ 主力低迷":"#fff3e0","❌ 課題商品":"#ffebee"}
+                          "⚠️ 主力低迷":"#fff3e0","❌ 課題商品":"#ffebee","🆕 新規商品":"#e3f2fd"}
                 styles = pd.DataFrame("", index=df.index, columns=df.columns)
                 if "象限" in df.columns:
                     for q, c in colors.items():
