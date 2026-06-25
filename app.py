@@ -1504,6 +1504,16 @@ with tab_tana:
         k4.metric("⚠️ 苦戦品", f"{(tana_df['業績']=='⚠️ 苦戦').sum()}品")
         k5.metric("💀 売上ゼロ", f"{(tana_df['業績']=='💀 売上ゼロ').sum()}品")
 
+        # カバー率（棚内売上 ÷ カテゴリ全体売上）
+        total_all_period = sales_base["売上金額"].sum()
+        if total_all_period > 0:
+            cov = total_sales_t / total_all_period * 100
+            st.caption(
+                f"📦 この棚内 {tana_df['JAN13'].nunique()}品で "
+                f"メンズビューティ全体売上（{fmt_yen(total_all_period)}）の **{cov:.1f}%** をカバー。"
+                f"　※上部KPIは全商品（改廃品込み）、棚割KPIは現行棚の550品ベースのため昨対比は一致しません"
+            )
+
         st.markdown("---")
 
         # ── 棚割図（実際の棚レイアウトを再現） ──────────────────
