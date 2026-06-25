@@ -1429,52 +1429,71 @@ with tab_tana:
         tana_df["売上数量"] = tana_df["売上数量"].fillna(0)
         tana_df["商品名"] = tana_df["商品名"].fillna("（売上データなし）")
         tana_df["1フェース売上"] = tana_df["売上金額"] / tana_df["フェース数"].replace(0, np.nan)
+        if "前期売上" not in tana_df.columns:
+            tana_df["前期売上"] = np.nan
+        tana_df["前期売上"] = tana_df["前期売上"].fillna(0)
+        tana_df["昨対比"] = np.where(
+            tana_df["前期売上"] > 0,
+            tana_df["売上金額"] / tana_df["前期売上"].replace(0, np.nan) * 100, np.nan)
+        tana_df["前年差"] = tana_df["売上金額"] - tana_df["前期売上"]
 
-        # シェアと効率判定
-        total_face  = tana_df["フェース数"].sum()
+        total_face    = tana_df["フェース数"].sum()
         total_sales_t = tana_df["売上金額"].sum()
+        total_prev_t  = tana_df["前期売上"].sum()
         tana_df["フェースシェア"] = tana_df["フェース数"] / total_face * 100 if total_face else 0
         tana_df["売上シェア"]     = tana_df["売上金額"] / total_sales_t * 100 if total_sales_t else 0
         tana_df["効率比"] = tana_df["売上シェア"] / tana_df["フェースシェア"].replace(0, np.nan)
 
+        # 業績区分（バイヤー向け：伸び/課題が一目でわかる）
+        def perf_class(r):
+            if r["売上金額"] <= 0:                          return "💀 売上ゼロ"
+            if pd.isna(r["昨対比"]):                         return "🆕 新規"
+            if r["昨対比"] >= 105:                           return "🌟 伸長"
+            if r["昨対比"] >= 95:                            return "→ 横ばい"
+            return "⚠️ 苦戦"
+        tana_df["業績"] = tana_df.apply(perf_class, axis=1)
+
+        # フェース推奨（1フェースは"減らせない"＝過剰判定しない）
         def judge_face(r):
-            if pd.isna(r["効率比"]):       return "❓ 判定不可"
-            if r["売上金額"] <= 0:          return "📉 フェース過剰"
-            if r["効率比"] >= 1.3:          return "📈 フェース増やすべき"
-            if r["効率比"] >= 0.7:          return "✅ 適正"
-            return "📉 フェース過剰"
-        tana_df["判定"] = tana_df.apply(judge_face, axis=1)
+            if r["フェース数"] >= 2 and pd.notna(r["効率比"]) and r["効率比"] < 0.6:
+                return "📉 フェース減らせる"
+            if pd.notna(r["効率比"]) and r["効率比"] >= 1.5 and r["売上金額"] > 0:
+                return "📈 フェース増やす候補"
+            return "✅ 適正"
+        tana_df["フェース推奨"] = tana_df.apply(judge_face, axis=1)
 
         # ── KPI ──────────────────────────────────
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("総フェース数", f"{int(total_face):,}")
-        k2.metric("棚内商品数", f"{tana_df['JAN13'].nunique():,}")
-        k3.metric("棚内売上合計", fmt_yen(total_sales_t))
-        avg_face_sales = total_sales_t / total_face if total_face else 0
-        k4.metric("1フェース平均売上", fmt_yen(avg_face_sales))
-
-        # 売上ゼロ（死に筋）件数
-        dead = tana_df[tana_df["売上金額"] <= 0]
-        if len(dead) > 0:
-            st.caption(f"⚠️ 棚内で当期売上0の商品: {len(dead)}品（{dead['フェース数'].sum():.0f}フェース占有）")
+        shelf_yoy = total_sales_t / total_prev_t * 100 if total_prev_t > 0 else None
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("棚内売上合計", fmt_yen(total_sales_t))
+        if shelf_yoy is not None:
+            k2.metric("棚全体 昨対比", f"{shelf_yoy:.1f}%",
+                      delta=f"{total_sales_t-total_prev_t:+,.0f}円")
+        else:
+            k2.metric("棚全体 昨対比", "—")
+        k3.metric("🌟 伸長品", f"{(tana_df['業績']=='🌟 伸長').sum()}品")
+        k4.metric("⚠️ 苦戦品", f"{(tana_df['業績']=='⚠️ 苦戦').sum()}品")
+        k5.metric("💀 売上ゼロ", f"{(tana_df['業績']=='💀 売上ゼロ').sum()}品")
 
         st.markdown("---")
 
         # ── 棚割図（実際の棚レイアウトを再現） ──────────────────
         tana_images = tana_data.get("images") or {}
         st.markdown("#### 🗄️ 棚割図（実際の棚レイアウト）")
-        cm1, cm2 = st.columns([1, 3])
+        cm1, cm2, cm3 = st.columns([1.2, 1.2, 2])
         metric_choice = cm1.selectbox(
-            "枠の色（業績）", ["売上金額", "効率比", "売上数量", "1フェース売上"], key="tana_heat_metric")
-        if tana_images:
-            cm2.caption("各マス＝実際の商品。フェース数ぶんの幅。台が横並び・上が上段。枠 緑＝好調 / 赤＝不調")
+            "枠の色", ["昨対比", "売上金額", "売上数量", "効率比"], key="tana_heat_metric")
+        size_px = cm2.slider("表示サイズ", min_value=10, max_value=40, value=26, step=2,
+                             key="tana_size", help="小さくすると棚全体が見渡せます")
+        if metric_choice == "昨対比":
+            cm3.caption("枠 緑＝前年超え / 赤＝前年割れ / 灰＝新規・売上なし。各マス幅＝フェース数")
         else:
-            cm2.caption("各商品＝フェース数ぶんの幅の四角。ZIPで入れ直すと商品画像付きで表示されます")
+            cm3.caption("枠 緑＝高い / 赤＝低い。各マス幅＝フェース数。台が横並び・上が上段")
 
         # 配置 × 売上指標
         pos2 = placement.merge(
-            tana_df[["JAN13", "商品名", "売上金額", "売上数量", "効率比", "1フェース売上", "判定"]]
-            .rename(columns={"JAN13": "JAN"}),
+            tana_df[["JAN13", "商品名", "売上金額", "売上数量", "効率比", "昨対比",
+                     "前期売上", "業績", "フェース推奨"]].rename(columns={"JAN13": "JAN"}),
             on="JAN", how="left")
         pos2["台番号"]   = pd.to_numeric(pos2["台番号"], errors="coerce")
         pos2["棚段番号"] = pd.to_numeric(pos2["棚段番号"], errors="coerce")
@@ -1483,8 +1502,8 @@ with tab_tana:
         pos2 = pos2.dropna(subset=["台番号", "棚段番号"]).sort_values(["台番号", "棚段番号", "棚位置"])
 
         def lerp_rygb(t):
-            """0=赤 0.5=黄 1=緑"""
-            if pd.isna(t): return "rgb(190,190,190)"
+            """0=赤 0.5=黄 1=緑、NaN=灰"""
+            if pd.isna(t): return "rgb(150,150,150)"
             t = max(0.0, min(1.0, float(t)))
             if t < 0.5:
                 f = t / 0.5
@@ -1495,8 +1514,10 @@ with tab_tana:
             return f"rgb({int(r)},{int(g)},{int(b)})"
 
         mv = pos2[metric_choice]
-        if metric_choice == "効率比":
-            norm = (mv - 0.5) / (1.5 - 0.5)  # 0.5→0,1.0→0.5,1.5→1
+        if metric_choice == "昨対比":
+            norm = (mv - 70) / (130 - 70)   # 70→赤 100→黄 130→緑、新規/0売上はNaN→灰
+        elif metric_choice == "効率比":
+            norm = (mv - 0.5) / (1.5 - 0.5)
         else:
             cap = mv.quantile(0.95)
             norm = mv / cap if cap and cap > 0 else mv * 0
@@ -1505,25 +1526,25 @@ with tab_tana:
         bays = sorted(pos2["台番号"].unique())
 
         if tana_images:
-            # ── 商品画像つきHTML棚割図 ──
-            FACE_PX = 30   # 1フェースあたりの幅(px)
-            ROW_H   = 78   # 棚段の高さ(px)
+            # ── 商品画像つきHTML棚割図（サイズ可変） ──
+            FACE_PX = int(size_px)
+            ROW_H   = int(size_px * 2.6)
             def cell_html(r):
-                jan = r["JAN"]
                 wpx = int(r["w"]) * FACE_PX
                 col = r["_color"]
-                b64 = tana_images.get(jan)
-                eff = f"{r['効率比']:.2f}" if pd.notna(r['効率比']) else "—"
-                tip = (f"{r['商品名']} / {int(r['フェース数'])}F / "
-                       f"売上¥{r['売上金額']:,.0f} / 効率比{eff}").replace('"', "")
+                b64 = tana_images.get(r["JAN"])
+                yoy = f"{r['昨対比']:.0f}%" if pd.notna(r['昨対比']) else "新規/なし"
+                tip = (f"{r['商品名']} / {int(r['フェース数'])}F / 売上¥{r['売上金額']:,.0f}"
+                       f" / 昨対{yoy} / {r['業績']}").replace('"', "")
                 inner = (f'<img src="data:image/jpeg;base64,{b64}" '
-                         f'style="height:{ROW_H-10}px;width:100%;object-fit:contain;display:block;">'
+                         f'style="height:{ROW_H-8}px;width:100%;object-fit:contain;display:block;">'
                          if b64 else
-                         f'<div style="height:{ROW_H-10}px;display:flex;align-items:center;'
-                         f'justify-content:center;font-size:8px;color:#fff;text-align:center;">'
-                         f'{str(r["商品名"])[:10]}</div>')
+                         f'<div style="height:{ROW_H-8}px;display:flex;align-items:center;'
+                         f'justify-content:center;font-size:7px;color:#fff;text-align:center;">'
+                         f'{str(r["商品名"])[:8]}</div>')
+                bw = max(2, FACE_PX // 10)
                 return (f'<div title="{tip}" style="width:{wpx}px;flex:0 0 {wpx}px;'
-                        f'border:3px solid {col};border-radius:3px;background:#3a3a3a;'
+                        f'border:{bw}px solid {col};border-radius:2px;background:#3a3a3a;'
                         f'box-sizing:border-box;overflow:hidden;">{inner}</div>')
 
             bay_html = []
@@ -1537,14 +1558,15 @@ with tab_tana:
                         f'<div style="display:flex;gap:1px;align-items:flex-end;'
                         f'border-bottom:3px solid #111;padding-bottom:1px;">{cells}</div>')
                 bay_html.append(
-                    f'<div style="display:flex;flex-direction:column;gap:3px;">'
-                    f'<div style="text-align:center;color:#eee;font-size:12px;'
+                    f'<div style="display:flex;flex-direction:column;gap:2px;">'
+                    f'<div style="text-align:center;color:#eee;font-size:11px;'
                     f'font-weight:bold;">台{int(b)}</div>{"".join(rows_html)}</div>')
-            html = (f'<div style="display:flex;gap:14px;background:#222;padding:14px;'
+            html = (f'<div style="display:flex;gap:12px;background:#222;padding:12px;'
                     f'border-radius:6px;overflow-x:auto;">{"".join(bay_html)}</div>')
-            components.html(html, height=ROW_H * 11 + 80, scrolling=True)
+            max_shelves = pos2.groupby("台番号")["棚段番号"].nunique().max()
+            components.html(html, height=int(max_shelves * (ROW_H + 4) + 70), scrolling=True)
         else:
-            # ── 画像なし: 従来の色四角（Plotly） ──
+            # ── 画像なし: 色四角（Plotly） ──
             bay_w = pos2.groupby("台番号").apply(
                 lambda g: g.groupby("棚段番号")["w"].sum().max()).to_dict()
             gap = 1.5
@@ -1562,9 +1584,10 @@ with tab_tana:
                                    line=dict(color="white", width=0.5),
                                    fillcolor=r["_color"], layer="below")
                     hx.append(x + w / 2); hy.append(s + 0.46)
+                    yoy = f"{r['昨対比']:.0f}%" if pd.notna(r['昨対比']) else "新規"
                     htext.append(
                         f"{r['商品名']}<br>台{int(b)}-段{int(s)}｜{int(r['フェース数'])}F"
-                        f"<br>売上 ¥{r['売上金額']:,.0f}")
+                        f"<br>売上 ¥{r['売上金額']:,.0f}｜昨対 {yoy}")
                     x += w
             figh.add_trace(go.Scatter(x=hx, y=hy, mode="markers",
                 marker=dict(size=12, opacity=0), hoverinfo="text", hovertext=htext,
@@ -1581,105 +1604,110 @@ with tab_tana:
 
         st.markdown("---")
 
-        # ── フェース効率散布図 ──────────────────────
-        st.markdown("#### フェース効率マップ（フェース数 × 売上金額）")
-        JUDGE_COLOR = {
-            "📈 フェース増やすべき": "#2ca02c",
-            "✅ 適正": "#1f77b4",
-            "📉 フェース過剰": "#d62728",
-            "❓ 判定不可": "#cccccc",
-        }
-        plot_t = tana_df.copy()
-        figt = px.scatter(
-            plot_t, x="フェース数", y="売上金額",
-            color="判定", color_discrete_map=JUDGE_COLOR,
-            size="売上数量", hover_name="商品名",
-            hover_data={"JAN13": True, "フェース数": True, "1フェース売上": ":,.0f",
-                        "効率比": ":.2f", "売上金額": ":,.0f"},
-            title="右下＝売れてるのにフェース少（増やす）／左上はないが、低売上×多フェースは減らす",
-            size_max=40,
-        )
-        # 平均1フェース売上の基準線（y = avg * x）
-        if total_face:
-            xmax = plot_t["フェース数"].max()
-            figt.add_shape(type="line", x0=0, y0=0, x1=xmax, y1=avg_face_sales * xmax,
-                           line=dict(color="#888", dash="dash"))
-            figt.add_annotation(x=xmax, y=avg_face_sales * xmax, text="平均効率線",
-                                showarrow=False, font=dict(color="#888", size=10))
-        figt.update_layout(height=520, legend=dict(orientation="h", y=-0.2),
-                           yaxis=dict(title="売上金額（円）"))
-        st.plotly_chart(figt, use_container_width=True)
-
-        st.markdown("---")
-
-        # ── 台別・棚段別サマリー ─────────────────────
-        st.markdown("#### 台別・棚段別 実績サマリー")
-        # 配置に売上を結合（位置別）
+        # ── 台別 売上構成比・貢献度 ─────────────────────
+        st.markdown("#### 📊 台別 売上構成比・貢献度（前年差）")
         pos = placement.merge(
-            tana_df[["JAN13", "売上金額", "売上数量"]].rename(columns={"JAN13": "JAN"}),
+            tana_df[["JAN13", "売上金額", "前期売上"]].rename(columns={"JAN13": "JAN"}),
             on="JAN", how="left")
-        # フェース按分で売上を位置に配分（同一JANが複数配置の場合）
         face_total_by_jan = placement.groupby("JAN")["フェース数"].transform("sum")
-        pos["位置売上"] = pos["売上金額"].fillna(0) * (pos["フェース数"] / face_total_by_jan.replace(0, np.nan))
+        ratio = pos["フェース数"] / face_total_by_jan.replace(0, np.nan)
+        pos["位置売上"]   = pos["売上金額"].fillna(0) * ratio
+        pos["位置前年"]   = pos["前期売上"].fillna(0) * ratio
 
-        cda, cdb = st.columns(2)
+        dai = pos.groupby("台番号").agg(
+            フェース数=("フェース数", "sum"),
+            商品数=("JAN", "nunique"),
+            売上金額=("位置売上", "sum"),
+            前年売上=("位置前年", "sum"),
+        ).reset_index()
+        dai["売上構成比"] = dai["売上金額"] / dai["売上金額"].sum() * 100
+        dai["昨対比"]     = np.where(dai["前年売上"] > 0, dai["売上金額"] / dai["前年売上"] * 100, np.nan)
+        dai["前年差"]     = dai["売上金額"] - dai["前年売上"]
+        dai["台"] = "台" + dai["台番号"].astype(int).astype(str)
+
+        cda, cdb = st.columns([3, 2])
         with cda:
-            st.markdown("**台別**")
-            dai = pos.groupby("台番号").agg(
-                フェース数=("フェース数", "sum"),
-                商品数=("JAN", "nunique"),
-                売上金額=("位置売上", "sum"),
-            ).reset_index()
-            dai["1フェース売上"] = dai["売上金額"] / dai["フェース数"].replace(0, np.nan)
-            dai["売上構成比"] = dai["売上金額"] / dai["売上金額"].sum() * 100
+            fig_share = px.bar(
+                dai.sort_values("台番号"), x="台", y="売上金額",
+                color="昨対比", color_continuous_scale=["#d62728", "#ffdd00", "#2ca02c"],
+                color_continuous_midpoint=100, text="売上構成比",
+                title="台別売上（色＝昨対比、棒上＝構成比）",
+            )
+            fig_share.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+            fig_share.update_layout(height=380, yaxis_title="売上金額（円）",
+                                    coloraxis_colorbar=dict(title="昨対比"))
+            st.plotly_chart(fig_share, use_container_width=True)
+        with cdb:
+            st.markdown("**台別サマリー**")
             st.dataframe(
-                dai.style.format({
-                    "フェース数": "{:.0f}", "商品数": "{:.0f}",
-                    "売上金額": "¥{:,.0f}", "1フェース売上": "¥{:,.0f}", "売上構成比": "{:.1f}%",
+                dai[["台", "売上金額", "売上構成比", "昨対比", "前年差", "フェース数"]]
+                .sort_values("売上金額", ascending=False).style.format({
+                    "売上金額": "¥{:,.0f}", "売上構成比": "{:.1f}%", "昨対比": "{:.1f}%",
+                    "前年差": "{:+,.0f}", "フェース数": "{:.0f}",
                 }, na_rep="—"),
                 use_container_width=True, hide_index=True,
             )
-        with cdb:
-            st.markdown("**棚段別（台-段）**")
-            dan = pos.groupby(["台番号", "棚段番号"]).agg(
-                フェース数=("フェース数", "sum"),
-                売上金額=("位置売上", "sum"),
-            ).reset_index()
-            dan["1フェース売上"] = dan["売上金額"] / dan["フェース数"].replace(0, np.nan)
-            dan["台-段"] = dan["台番号"].astype(str) + "-" + dan["棚段番号"].astype(str)
+
+        st.markdown("---")
+
+        # ── バイヤー向け：伸びている商品 / 課題商品 ─────────────
+        st.markdown("#### 🎯 バイヤー注目リスト")
+        gcol, bcol = st.columns(2)
+        list_cols = ["商品名", "フェース数", "売上金額", "前期売上", "昨対比", "業績"]
+        with gcol:
+            st.markdown("##### 🌟 伸びている商品（昨対比 高い順）")
+            grow = tana_df[(tana_df["前期売上"] > 0) & (tana_df["昨対比"] >= 105)] \
+                .sort_values("昨対比", ascending=False).head(15)
             st.dataframe(
-                dan[["台-段", "フェース数", "売上金額", "1フェース売上"]].style.format({
-                    "フェース数": "{:.0f}", "売上金額": "¥{:,.0f}", "1フェース売上": "¥{:,.0f}",
-                }, na_rep="—"),
-                use_container_width=True, hide_index=True, height=320,
+                grow[list_cols].style.format({
+                    "フェース数": "{:.0f}", "売上金額": "¥{:,.0f}", "前期売上": "¥{:,.0f}",
+                    "昨対比": "{:.1f}%"}, na_rep="—")
+                .map(lambda v: "color:#1a7a1a;font-weight:bold", subset=["昨対比"]),
+                use_container_width=True, hide_index=True, height=420,
+            )
+        with bcol:
+            st.markdown("##### ⚠️ 課題商品（売上ゼロ・苦戦・多フェース不振）")
+            prob = tana_df[
+                (tana_df["売上金額"] <= 0) |
+                ((tana_df["前期売上"] > 0) & (tana_df["昨対比"] < 95)) |
+                (tana_df["フェース推奨"] == "📉 フェース減らせる")
+            ].copy()
+            # 課題の深刻度：フェース多い×売上低い×昨対悪いを上位に
+            prob["_severity"] = prob["フェース数"] * 1000 - prob["昨対比"].fillna(0)
+            prob = prob.sort_values(["フェース数", "_severity"], ascending=[False, False]).head(15)
+            st.dataframe(
+                prob[list_cols + ["フェース推奨"]].style.format({
+                    "フェース数": "{:.0f}", "売上金額": "¥{:,.0f}", "前期売上": "¥{:,.0f}",
+                    "昨対比": "{:.1f}%"}, na_rep="—")
+                .map(lambda v: "color:#c62828;font-weight:bold", subset=["昨対比"]),
+                use_container_width=True, hide_index=True, height=420,
             )
 
         st.markdown("---")
 
-        # ── フェース効率ランキング ───────────────────
-        st.markdown("#### 商品別フェース効率（効率比＝売上シェア÷フェースシェア）")
-        rank_cols = ["商品名", "JAN13", "フェース数", "売上金額", "売上数量",
-                     "1フェース売上", "フェースシェア", "売上シェア", "効率比", "判定"]
+        # ── 全商品テーブル（DL用） ───────────────────
+        st.markdown("#### 棚内 全商品（売上順）")
+        PERF_BG = {"🌟 伸長": "#e8f5e9", "→ 横ばい": "#f5f5f5",
+                   "⚠️ 苦戦": "#ffebee", "🆕 新規": "#e3f2fd", "💀 売上ゼロ": "#fce4ec"}
+        rank_cols = ["商品名", "JAN13", "フェース数", "売上金額", "前期売上", "昨対比",
+                     "売上数量", "効率比", "業績", "フェース推奨"]
         rank_cols = [c for c in rank_cols if c in tana_df.columns]
-        tana_rank = tana_df[rank_cols].sort_values("効率比", ascending=False, na_position="last")
+        tana_rank = tana_df[rank_cols].sort_values("売上金額", ascending=False)
 
-        def color_judge(df):
+        def color_perf(df):
             styles = pd.DataFrame("", index=df.index, columns=df.columns)
-            cmap = {"📈 フェース増やすべき": "#e8f5e9", "✅ 適正": "#e3f2fd",
-                    "📉 フェース過剰": "#ffebee", "❓ 判定不可": "#f5f5f5"}
-            if "判定" in df.columns:
-                for j, c in cmap.items():
-                    styles.loc[df["判定"] == j] = f"background-color:{c}"
+            if "業績" in df.columns:
+                for j, c in PERF_BG.items():
+                    styles.loc[df["業績"] == j] = f"background-color:{c}"
             return styles
 
         make_download_button(tana_rank, f"棚割分析_{tana_data['name']}_{period_label}.csv")
         st.dataframe(
             tana_rank.style
-            .format({"フェース数": "{:.0f}", "売上金額": "¥{:,.0f}", "売上数量": "{:,.0f}",
-                     "1フェース売上": "¥{:,.0f}", "フェースシェア": "{:.2f}%",
-                     "売上シェア": "{:.2f}%", "効率比": "{:.2f}"}, na_rep="—")
-            .apply(color_judge, axis=None),
-            use_container_width=True, hide_index=True, height=460,
+            .format({"フェース数": "{:.0f}", "売上金額": "¥{:,.0f}", "前期売上": "¥{:,.0f}",
+                     "昨対比": "{:.1f}%", "売上数量": "{:,.0f}", "効率比": "{:.2f}"}, na_rep="—")
+            .apply(color_perf, axis=None),
+            use_container_width=True, hide_index=True, height=420,
         )
 
         st.markdown("---")
@@ -1691,10 +1719,14 @@ with tab_tana:
         not_in = sales_jan[~sales_jan["JAN13"].isin(in_shelf)].copy()
         not_in = not_in[not_in["売上金額"] > 0].sort_values("売上金額", ascending=False).head(20)
         if len(not_in) > 0:
-            show_ni = ["商品名", "JAN13", "売上金額", "売上数量"]
-            show_ni = [c for c in show_ni if c in not_in.columns]
+            if "前期売上" in not_in.columns:
+                not_in["昨対比"] = np.where(not_in["前期売上"] > 0,
+                    not_in["売上金額"] / not_in["前期売上"].replace(0, np.nan) * 100, np.nan)
+            show_ni = [c for c in ["商品名", "JAN13", "売上金額", "売上数量", "昨対比"]
+                       if c in not_in.columns]
             st.dataframe(
-                not_in[show_ni].style.format({"売上金額": "¥{:,.0f}", "売上数量": "{:,.0f}"}, na_rep="—"),
+                not_in[show_ni].style.format(
+                    {"売上金額": "¥{:,.0f}", "売上数量": "{:,.0f}", "昨対比": "{:.1f}%"}, na_rep="—"),
                 use_container_width=True, hide_index=True,
             )
         else:
