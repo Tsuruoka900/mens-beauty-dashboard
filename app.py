@@ -1,5 +1,9 @@
 import re
+import io
+import base64
+import zipfile
 import streamlit as st
+import streamlit.components.v1 as components
 import pandas as pd
 import numpy as np
 import plotly.express as px
@@ -147,12 +151,8 @@ def load_trmaster(file) -> pd.DataFrame:
     return df[keep].drop_duplicates("JAN").reset_index(drop=True)
 
 
-@st.cache_data
-def load_tanawari(file) -> dict | None:
-    """共通棚割情報フォーマット(V3.0)CSVを読み込む。
-    返り値: {"name": 棚割名, "placement": DataFrame(台番号,棚段番号,棚位置,JAN,フェース数,在庫数量)}
-    """
-    raw = file.read() if hasattr(file, "read") else open(file, "rb").read()
+def _parse_tanawari_csv(raw: bytes) -> dict | None:
+    """共通棚割情報フォーマット(V3.0)のバイト列をパースする。"""
     text = raw.decode("cp932", errors="replace")
     lines = [l.rstrip("\r\n") for l in text.split("\n")]
 
@@ -202,6 +202,76 @@ def load_tanawari(file) -> dict | None:
     placed = (df["台番号"] >= 1) & (df["棚段番号"] >= 1) & (df["棚位置"] >= 1)
     df = df[placed].copy()
     return {"name": name, "placement": df.reset_index(drop=True)}
+
+
+def _build_images_from_zip(zf: zipfile.ZipFile, thumb_h: int = 64) -> dict:
+    """ZIP内の各商品フォルダ(Data.csv + Image1.jpg)からJAN13→サムネイルbase64を作る。"""
+    try:
+        from PIL import Image
+    except Exception:
+        return {}
+    names = zf.namelist()
+    name_lower = {n.replace("\\", "/").lower(): n for n in names}
+    images = {}
+    for n in names:
+        if not n.replace("\\", "/").endswith("Data.csv"):
+            continue
+        folder = n.replace("\\", "/").rsplit("/", 1)[0]
+        try:
+            with zf.open(n) as f:
+                first = f.read().decode("cp932", "replace").split("\n")[0].split(",")
+            if len(first) < 3:
+                continue
+            jan13 = str(first[2]).strip().lstrip("0").zfill(13)
+            img_key = (folder + "/Image1.jpg").lower()
+            real = name_lower.get(img_key)
+            if real is None:
+                continue
+            with zf.open(real) as f:
+                im = Image.open(io.BytesIO(f.read())).convert("RGB")
+            w, h = im.size
+            nw = max(1, int(w * thumb_h / h))
+            im = im.resize((nw, thumb_h))
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=70)
+            images[jan13] = base64.b64encode(buf.getvalue()).decode()
+        except Exception:
+            continue
+    return images
+
+
+@st.cache_data
+def load_tanawari(file) -> dict | None:
+    """棚割CSV単体、または商品画像入りZIPを読み込む。
+    返り値: {"name", "placement" DataFrame, "images" {JAN13: base64jpeg}}
+    """
+    raw = file.read() if hasattr(file, "read") else open(file, "rb").read()
+    bio = io.BytesIO(raw)
+
+    if zipfile.is_zipfile(bio):
+        bio.seek(0)
+        zf = zipfile.ZipFile(bio)
+        # ルート直下（フォルダ階層なし）のCSV＝共通棚割情報
+        root_csv = None
+        for n in zf.namelist():
+            nn = n.replace("\\", "/")
+            if nn.count("/") == 0 and nn.lower().endswith(".csv"):
+                root_csv = n
+                break
+        if root_csv is None:
+            return None
+        parsed = _parse_tanawari_csv(zf.read(root_csv))
+        if parsed is None:
+            return None
+        parsed["images"] = _build_images_from_zip(zf)
+        return parsed
+
+    # 単体CSV
+    parsed = _parse_tanawari_csv(raw)
+    if parsed is None:
+        return None
+    parsed["images"] = {}
+    return parsed
 
 
 def compute_market(df_sri_long, df_trmaster,
@@ -293,6 +363,7 @@ _TRMASTER_CACHE = pathlib.Path(__file__).parent / ".trmaster_cache.parquet"
 _MASTER_CACHE   = pathlib.Path(__file__).parent / ".master_cache.parquet"
 _TANA_CACHE     = pathlib.Path(__file__).parent / ".tanawari_cache.parquet"
 _TANA_NAME      = pathlib.Path(__file__).parent / ".tanawari_name.txt"
+_TANA_IMG       = pathlib.Path(__file__).parent / ".tanawari_img.parquet"
 
 def save_trmaster(df: pd.DataFrame):
     df.to_parquet(_TRMASTER_CACHE, index=False)
@@ -329,11 +400,21 @@ def load_sri_cache() -> pd.DataFrame | None:
 def save_tanawari(data: dict):
     data["placement"].to_parquet(_TANA_CACHE, index=False)
     _TANA_NAME.write_text(data.get("name", "棚割"), encoding="utf-8")
+    images = data.get("images") or {}
+    if images:
+        pd.DataFrame({"JAN13": list(images.keys()), "b64": list(images.values())}
+                     ).to_parquet(_TANA_IMG, index=False)
+    else:
+        _TANA_IMG.unlink(missing_ok=True)
 
 def load_tanawari_cache() -> dict | None:
     if _TANA_CACHE.exists():
         name = _TANA_NAME.read_text(encoding="utf-8").strip() if _TANA_NAME.exists() else "棚割"
-        return {"name": name, "placement": pd.read_parquet(_TANA_CACHE)}
+        images = {}
+        if _TANA_IMG.exists():
+            idf = pd.read_parquet(_TANA_IMG)
+            images = dict(zip(idf["JAN13"], idf["b64"]))
+        return {"name": name, "placement": pd.read_parquet(_TANA_CACHE), "images": images}
     return None
 
 # ─────────────────────────────────────────────
@@ -387,8 +468,8 @@ with st.sidebar:
                 st.rerun()
 
         tana_file = st.file_uploader(
-            "⑤ 棚割CSV（共通棚割情報）", type=["csv"], key="tana",
-            help="棚POWER等の共通棚割情報フォーマット。アップロードするとローカルに保存されます",
+            "⑤ 棚割CSV / ZIP（共通棚割情報＋商品画像）", type=["csv", "zip"], key="tana",
+            help="ZIPごと入れると商品画像付きの棚割図が出ます。CSV単体なら色分けのみ",
         )
         if tana_file:
             st.caption("✅ 棚割を保存しました（次回以降は不要）")
@@ -397,6 +478,7 @@ with st.sidebar:
             if st.button("🗑️ 棚割をリセット", key="tana_reset"):
                 _TANA_CACHE.unlink(missing_ok=True)
                 _TANA_NAME.unlink(missing_ok=True)
+                _TANA_IMG.unlink(missing_ok=True)
                 st.rerun()
     else:
         idpos_file   = st.session_state.get("idpos")
@@ -1378,12 +1460,16 @@ with tab_tana:
 
         st.markdown("---")
 
-        # ── 棚割図ヒートマップ（実際の棚レイアウトを再現） ──────────
-        st.markdown("#### 🗄️ 棚割図ヒートマップ（実際の棚レイアウトで色分け）")
+        # ── 棚割図（実際の棚レイアウトを再現） ──────────────────
+        tana_images = tana_data.get("images") or {}
+        st.markdown("#### 🗄️ 棚割図（実際の棚レイアウト）")
         cm1, cm2 = st.columns([1, 3])
         metric_choice = cm1.selectbox(
-            "色の指標", ["売上金額", "効率比", "売上数量", "1フェース売上"], key="tana_heat_metric")
-        cm2.caption("各商品＝フェース数ぶんの幅の四角。台が横並び、上が上段。緑＝好調 / 赤＝不調")
+            "枠の色（業績）", ["売上金額", "効率比", "売上数量", "1フェース売上"], key="tana_heat_metric")
+        if tana_images:
+            cm2.caption("各マス＝実際の商品。フェース数ぶんの幅。台が横並び・上が上段。枠 緑＝好調 / 赤＝不調")
+        else:
+            cm2.caption("各商品＝フェース数ぶんの幅の四角。ZIPで入れ直すと商品画像付きで表示されます")
 
         # 配置 × 売上指標
         pos2 = placement.merge(
@@ -1398,7 +1484,7 @@ with tab_tana:
 
         def lerp_rygb(t):
             """0=赤 0.5=黄 1=緑"""
-            if pd.isna(t): return "rgb(220,220,220)"
+            if pd.isna(t): return "rgb(190,190,190)"
             t = max(0.0, min(1.0, float(t)))
             if t < 0.5:
                 f = t / 0.5
@@ -1416,54 +1502,82 @@ with tab_tana:
             norm = mv / cap if cap and cap > 0 else mv * 0
         pos2["_color"] = norm.map(lerp_rygb)
 
-        # 台ごとの幅（最も広い棚段の合計フェース）
-        bay_w = pos2.groupby("台番号").apply(
-            lambda g: g.groupby("棚段番号")["w"].sum().max()).to_dict()
         bays = sorted(pos2["台番号"].unique())
-        gap = 1.5
-        offset, acc = {}, 0.0
-        for b in bays:
-            offset[b] = acc
-            acc += bay_w[b] + gap
 
-        figh = go.Figure()
-        hx, hy, htext = [], [], []
-        for (b, s), g in pos2.groupby(["台番号", "棚段番号"]):
-            x = offset[b]
-            for _, r in g.iterrows():
-                w = r["w"]
-                figh.add_shape(type="rect", x0=x, x1=x + w, y0=s, y1=s + 0.92,
-                               line=dict(color="white", width=0.5),
-                               fillcolor=r["_color"], layer="below")
-                hx.append(x + w / 2); hy.append(s + 0.46)
-                nm = str(r["商品名"])[:18]
-                htext.append(
-                    f"{r['商品名']}<br>台{int(b)}-段{int(s)}｜{int(r['フェース数'])}F"
-                    f"<br>売上 ¥{r['売上金額']:,.0f}<br>効率比 {r['効率比']:.2f}"
-                    if pd.notna(r['効率比']) else
-                    f"{r['商品名']}<br>台{int(b)}-段{int(s)}｜{int(r['フェース数'])}F"
-                    f"<br>売上 ¥{r['売上金額']:,.0f}")
-                # 幅が広い四角だけ商品名を表示
-                if w >= 3:
-                    figh.add_annotation(x=x + w / 2, y=s + 0.46, text=nm,
-                                        showarrow=False, font=dict(size=7, color="#222"),
-                                        textangle=90)
-                x += w
-        figh.add_trace(go.Scatter(
-            x=hx, y=hy, mode="markers",
-            marker=dict(size=12, opacity=0), hoverinfo="text", hovertext=htext,
-            showlegend=False))
+        if tana_images:
+            # ── 商品画像つきHTML棚割図 ──
+            FACE_PX = 30   # 1フェースあたりの幅(px)
+            ROW_H   = 78   # 棚段の高さ(px)
+            def cell_html(r):
+                jan = r["JAN"]
+                wpx = int(r["w"]) * FACE_PX
+                col = r["_color"]
+                b64 = tana_images.get(jan)
+                eff = f"{r['効率比']:.2f}" if pd.notna(r['効率比']) else "—"
+                tip = (f"{r['商品名']} / {int(r['フェース数'])}F / "
+                       f"売上¥{r['売上金額']:,.0f} / 効率比{eff}").replace('"', "")
+                inner = (f'<img src="data:image/jpeg;base64,{b64}" '
+                         f'style="height:{ROW_H-10}px;width:100%;object-fit:contain;display:block;">'
+                         if b64 else
+                         f'<div style="height:{ROW_H-10}px;display:flex;align-items:center;'
+                         f'justify-content:center;font-size:8px;color:#fff;text-align:center;">'
+                         f'{str(r["商品名"])[:10]}</div>')
+                return (f'<div title="{tip}" style="width:{wpx}px;flex:0 0 {wpx}px;'
+                        f'border:3px solid {col};border-radius:3px;background:#3a3a3a;'
+                        f'box-sizing:border-box;overflow:hidden;">{inner}</div>')
 
-        # 台ラベル
-        for b in bays:
-            figh.add_annotation(x=offset[b] + bay_w[b] / 2, y=pos2["棚段番号"].max() + 1.3,
-                                text=f"台{int(b)}", showarrow=False,
-                                font=dict(size=12, color="#333"))
-        figh.update_xaxes(visible=False, range=[-0.5, acc])
-        figh.update_yaxes(visible=False, range=[0.5, pos2["棚段番号"].max() + 1.8])
-        figh.update_layout(height=560, margin=dict(l=10, r=10, t=10, b=10),
-                           plot_bgcolor="#2b2b2b")
-        st.plotly_chart(figh, use_container_width=True)
+            bay_html = []
+            for b in bays:
+                shelves = sorted(pos2[pos2["台番号"] == b]["棚段番号"].unique(), reverse=True)
+                rows_html = []
+                for s in shelves:
+                    g = pos2[(pos2["台番号"] == b) & (pos2["棚段番号"] == s)].sort_values("棚位置")
+                    cells = "".join(cell_html(r) for _, r in g.iterrows())
+                    rows_html.append(
+                        f'<div style="display:flex;gap:1px;align-items:flex-end;'
+                        f'border-bottom:3px solid #111;padding-bottom:1px;">{cells}</div>')
+                bay_html.append(
+                    f'<div style="display:flex;flex-direction:column;gap:3px;">'
+                    f'<div style="text-align:center;color:#eee;font-size:12px;'
+                    f'font-weight:bold;">台{int(b)}</div>{"".join(rows_html)}</div>')
+            html = (f'<div style="display:flex;gap:14px;background:#222;padding:14px;'
+                    f'border-radius:6px;overflow-x:auto;">{"".join(bay_html)}</div>')
+            components.html(html, height=ROW_H * 11 + 80, scrolling=True)
+        else:
+            # ── 画像なし: 従来の色四角（Plotly） ──
+            bay_w = pos2.groupby("台番号").apply(
+                lambda g: g.groupby("棚段番号")["w"].sum().max()).to_dict()
+            gap = 1.5
+            offset, acc = {}, 0.0
+            for b in bays:
+                offset[b] = acc
+                acc += bay_w[b] + gap
+            figh = go.Figure()
+            hx, hy, htext = [], [], []
+            for (b, s), g in pos2.groupby(["台番号", "棚段番号"]):
+                x = offset[b]
+                for _, r in g.iterrows():
+                    w = r["w"]
+                    figh.add_shape(type="rect", x0=x, x1=x + w, y0=s, y1=s + 0.92,
+                                   line=dict(color="white", width=0.5),
+                                   fillcolor=r["_color"], layer="below")
+                    hx.append(x + w / 2); hy.append(s + 0.46)
+                    htext.append(
+                        f"{r['商品名']}<br>台{int(b)}-段{int(s)}｜{int(r['フェース数'])}F"
+                        f"<br>売上 ¥{r['売上金額']:,.0f}")
+                    x += w
+            figh.add_trace(go.Scatter(x=hx, y=hy, mode="markers",
+                marker=dict(size=12, opacity=0), hoverinfo="text", hovertext=htext,
+                showlegend=False))
+            for b in bays:
+                figh.add_annotation(x=offset[b] + bay_w[b] / 2, y=pos2["棚段番号"].max() + 1.3,
+                                    text=f"台{int(b)}", showarrow=False,
+                                    font=dict(size=12, color="#333"))
+            figh.update_xaxes(visible=False, range=[-0.5, acc])
+            figh.update_yaxes(visible=False, range=[0.5, pos2["棚段番号"].max() + 1.8])
+            figh.update_layout(height=560, margin=dict(l=10, r=10, t=10, b=10),
+                               plot_bgcolor="#2b2b2b")
+            st.plotly_chart(figh, use_container_width=True)
 
         st.markdown("---")
 
