@@ -195,7 +195,12 @@ def load_tanawari(file) -> dict | None:
     for c in ["フェース数", "在庫数量", "積上陳列数", "奥行陳列数"]:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    for c in ["台番号", "棚段番号", "棚位置"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df[df["JAN"].str.match(r"^\d{13}$") & (df["JAN"] != "0000000000000")].copy()
+    # 台・段・位置がすべて1以上＝実際に陳列された商品のみ（台0段0位置0は未陳列の登録リスト）
+    placed = (df["台番号"] >= 1) & (df["棚段番号"] >= 1) & (df["棚位置"] >= 1)
+    df = df[placed].copy()
     return {"name": name, "placement": df.reset_index(drop=True)}
 
 
@@ -1370,6 +1375,95 @@ with tab_tana:
         dead = tana_df[tana_df["売上金額"] <= 0]
         if len(dead) > 0:
             st.caption(f"⚠️ 棚内で当期売上0の商品: {len(dead)}品（{dead['フェース数'].sum():.0f}フェース占有）")
+
+        st.markdown("---")
+
+        # ── 棚割図ヒートマップ（実際の棚レイアウトを再現） ──────────
+        st.markdown("#### 🗄️ 棚割図ヒートマップ（実際の棚レイアウトで色分け）")
+        cm1, cm2 = st.columns([1, 3])
+        metric_choice = cm1.selectbox(
+            "色の指標", ["売上金額", "効率比", "売上数量", "1フェース売上"], key="tana_heat_metric")
+        cm2.caption("各商品＝フェース数ぶんの幅の四角。台が横並び、上が上段。緑＝好調 / 赤＝不調")
+
+        # 配置 × 売上指標
+        pos2 = placement.merge(
+            tana_df[["JAN13", "商品名", "売上金額", "売上数量", "効率比", "1フェース売上", "判定"]]
+            .rename(columns={"JAN13": "JAN"}),
+            on="JAN", how="left")
+        pos2["台番号"]   = pd.to_numeric(pos2["台番号"], errors="coerce")
+        pos2["棚段番号"] = pd.to_numeric(pos2["棚段番号"], errors="coerce")
+        pos2["棚位置"]   = pd.to_numeric(pos2["棚位置"], errors="coerce")
+        pos2["w"] = pos2["フェース数"].clip(lower=1)
+        pos2 = pos2.dropna(subset=["台番号", "棚段番号"]).sort_values(["台番号", "棚段番号", "棚位置"])
+
+        def lerp_rygb(t):
+            """0=赤 0.5=黄 1=緑"""
+            if pd.isna(t): return "rgb(220,220,220)"
+            t = max(0.0, min(1.0, float(t)))
+            if t < 0.5:
+                f = t / 0.5
+                r, g, b = 214 + (255-214)*f, 39 + (221-39)*f, 40 + (0-40)*f
+            else:
+                f = (t - 0.5) / 0.5
+                r, g, b = 255 + (44-255)*f, 221 + (160-221)*f, 0 + (44-0)*f
+            return f"rgb({int(r)},{int(g)},{int(b)})"
+
+        mv = pos2[metric_choice]
+        if metric_choice == "効率比":
+            norm = (mv - 0.5) / (1.5 - 0.5)  # 0.5→0,1.0→0.5,1.5→1
+        else:
+            cap = mv.quantile(0.95)
+            norm = mv / cap if cap and cap > 0 else mv * 0
+        pos2["_color"] = norm.map(lerp_rygb)
+
+        # 台ごとの幅（最も広い棚段の合計フェース）
+        bay_w = pos2.groupby("台番号").apply(
+            lambda g: g.groupby("棚段番号")["w"].sum().max()).to_dict()
+        bays = sorted(pos2["台番号"].unique())
+        gap = 1.5
+        offset, acc = {}, 0.0
+        for b in bays:
+            offset[b] = acc
+            acc += bay_w[b] + gap
+
+        figh = go.Figure()
+        hx, hy, htext = [], [], []
+        for (b, s), g in pos2.groupby(["台番号", "棚段番号"]):
+            x = offset[b]
+            for _, r in g.iterrows():
+                w = r["w"]
+                figh.add_shape(type="rect", x0=x, x1=x + w, y0=s, y1=s + 0.92,
+                               line=dict(color="white", width=0.5),
+                               fillcolor=r["_color"], layer="below")
+                hx.append(x + w / 2); hy.append(s + 0.46)
+                nm = str(r["商品名"])[:18]
+                htext.append(
+                    f"{r['商品名']}<br>台{int(b)}-段{int(s)}｜{int(r['フェース数'])}F"
+                    f"<br>売上 ¥{r['売上金額']:,.0f}<br>効率比 {r['効率比']:.2f}"
+                    if pd.notna(r['効率比']) else
+                    f"{r['商品名']}<br>台{int(b)}-段{int(s)}｜{int(r['フェース数'])}F"
+                    f"<br>売上 ¥{r['売上金額']:,.0f}")
+                # 幅が広い四角だけ商品名を表示
+                if w >= 3:
+                    figh.add_annotation(x=x + w / 2, y=s + 0.46, text=nm,
+                                        showarrow=False, font=dict(size=7, color="#222"),
+                                        textangle=90)
+                x += w
+        figh.add_trace(go.Scatter(
+            x=hx, y=hy, mode="markers",
+            marker=dict(size=12, opacity=0), hoverinfo="text", hovertext=htext,
+            showlegend=False))
+
+        # 台ラベル
+        for b in bays:
+            figh.add_annotation(x=offset[b] + bay_w[b] / 2, y=pos2["棚段番号"].max() + 1.3,
+                                text=f"台{int(b)}", showarrow=False,
+                                font=dict(size=12, color="#333"))
+        figh.update_xaxes(visible=False, range=[-0.5, acc])
+        figh.update_yaxes(visible=False, range=[0.5, pos2["棚段番号"].max() + 1.8])
+        figh.update_layout(height=560, margin=dict(l=10, r=10, t=10, b=10),
+                           plot_bgcolor="#2b2b2b")
+        st.plotly_chart(figh, use_container_width=True)
 
         st.markdown("---")
 
