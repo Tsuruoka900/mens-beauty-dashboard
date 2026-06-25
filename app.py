@@ -934,11 +934,40 @@ with tab_subseg:
                     else:           styles.loc[idx, "昨対GAP"] = "color:#d62728; font-weight:bold"
             return styles
 
-        make_download_button(agg_ss[show_cols].sort_values("売上金額", ascending=False),
-                             f"サブセグメント別_{period_label}.csv")
+        # フィルター
+        ss_view = agg_ss[show_cols].sort_values("売上金額", ascending=False)
+        ssf1, ssf2, ssf3 = st.columns([1.4, 1.4, 2])
+        yoy_filter = ssf1.selectbox(
+            "金額昨対で絞り込み",
+            ["すべて", "🌟 110%以上", "✅ 100%以上", "⚠️ 100%未満", "🔴 90%未満"],
+            key="ss_filter_yoy")
+        gap_filter = ssf2.selectbox(
+            "市場GAPで絞り込み",
+            ["すべて", "📈 市場超え(GAP≥0)", "📉 市場割れ(GAP<0)"],
+            key="ss_filter_gap") if "昨対GAP" in ss_view.columns else "すべて"
+        kw_ss = ssf3.text_input("名称で検索（カテゴリ/セグ/サブセグ）", "",
+                                placeholder="例: シャンプー", key="ss_filter_kw")
+
+        if "金額昨対" in ss_view.columns:
+            y = ss_view["金額昨対"]
+            if   yoy_filter == "🌟 110%以上": ss_view = ss_view[y >= 110]
+            elif yoy_filter == "✅ 100%以上": ss_view = ss_view[y >= 100]
+            elif yoy_filter == "⚠️ 100%未満": ss_view = ss_view[y < 100]
+            elif yoy_filter == "🔴 90%未満":  ss_view = ss_view[y < 90]
+        if "昨対GAP" in ss_view.columns:
+            if   gap_filter == "📈 市場超え(GAP≥0)": ss_view = ss_view[ss_view["昨対GAP"] >= 0]
+            elif gap_filter == "📉 市場割れ(GAP<0)": ss_view = ss_view[ss_view["昨対GAP"] < 0]
+        if kw_ss.strip():
+            mask = pd.Series(False, index=ss_view.index)
+            for c in grp:
+                if c in ss_view.columns:
+                    mask |= ss_view[c].astype(str).str.contains(kw_ss.strip(), case=False, na=False)
+            ss_view = ss_view[mask]
+        st.caption(f"表示 {len(ss_view)}件")
+
+        make_download_button(ss_view, f"サブセグメント別_{period_label}.csv")
         st.dataframe(
-            agg_ss[show_cols].sort_values("売上金額", ascending=False)
-            .style
+            ss_view.style
             .format({k: v for k, v in fmt2.items() if k in show_cols}, na_rep="—")
             .apply(color_yoy_cols, axis=None),
             use_container_width=True, hide_index=True
