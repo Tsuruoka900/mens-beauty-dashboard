@@ -1685,7 +1685,7 @@ with tab_tana:
 
         st.markdown("---")
 
-        # ── 全商品テーブル（DL用） ───────────────────
+        # ── 全商品テーブル（フィルター＋DL） ───────────────────
         st.markdown("#### 棚内 全商品（売上順）")
         PERF_BG = {"🌟 伸長": "#e8f5e9", "→ 横ばい": "#f5f5f5",
                    "⚠️ 苦戦": "#ffebee", "🆕 新規": "#e3f2fd", "💀 売上ゼロ": "#fce4ec"}
@@ -1693,6 +1693,26 @@ with tab_tana:
                      "売上数量", "効率比", "業績", "フェース推奨"]
         rank_cols = [c for c in rank_cols if c in tana_df.columns]
         tana_rank = tana_df[rank_cols].sort_values("売上金額", ascending=False)
+
+        # フィルター
+        fc1, fc2, fc3 = st.columns([1.3, 1.3, 2])
+        perf_opts = [p for p in ["🌟 伸長", "→ 横ばい", "⚠️ 苦戦", "🆕 新規", "💀 売上ゼロ"]
+                     if p in tana_rank["業績"].unique()]
+        sel_perf = fc1.multiselect("業績で絞り込み", perf_opts, default=[],
+                                   placeholder="すべて", key="tana_filter_perf")
+        face_opts = [f for f in ["📈 フェース増やす候補", "📉 フェース減らせる", "✅ 適正"]
+                     if f in tana_rank["フェース推奨"].unique()]
+        sel_face = fc2.multiselect("フェース推奨で絞り込み", face_opts, default=[],
+                                   placeholder="すべて", key="tana_filter_face")
+        kw = fc3.text_input("商品名で検索", "", placeholder="例: ギャツビー", key="tana_filter_kw")
+
+        if sel_perf:
+            tana_rank = tana_rank[tana_rank["業績"].isin(sel_perf)]
+        if sel_face:
+            tana_rank = tana_rank[tana_rank["フェース推奨"].isin(sel_face)]
+        if kw.strip():
+            tana_rank = tana_rank[tana_rank["商品名"].str.contains(kw.strip(), case=False, na=False)]
+        st.caption(f"表示 {len(tana_rank)}件")
 
         def color_perf(df):
             styles = pd.DataFrame("", index=df.index, columns=df.columns)
