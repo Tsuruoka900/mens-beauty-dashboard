@@ -147,6 +147,58 @@ def load_trmaster(file) -> pd.DataFrame:
     return df[keep].drop_duplicates("JAN").reset_index(drop=True)
 
 
+@st.cache_data
+def load_tanawari(file) -> dict | None:
+    """共通棚割情報フォーマット(V3.0)CSVを読み込む。
+    返り値: {"name": 棚割名, "placement": DataFrame(台番号,棚段番号,棚位置,JAN,フェース数,在庫数量)}
+    """
+    raw = file.read() if hasattr(file, "read") else open(file, "rb").read()
+    text = raw.decode("cp932", errors="replace")
+    lines = [l.rstrip("\r\n") for l in text.split("\n")]
+
+    # 棚割名（2行目あたりの単独フィールド）
+    name = "棚割"
+    for line in lines[1:5]:
+        parts = line.split(",")
+        if len(parts) == 1 and parts[0].strip():
+            name = parts[0].strip()
+            break
+
+    # 商品配置セクションのヘッダー行を探す（商品コードとフェース数を含む）
+    hdr_idx = None
+    for i, line in enumerate(lines):
+        parts = line.split(",")
+        if "商品コード" in parts and "フェース数" in parts:
+            hdr_idx = i
+            break
+    if hdr_idx is None:
+        return None
+
+    hdr = lines[hdr_idx].split(",")
+    rows = []
+    for line in lines[hdr_idx + 1:]:
+        parts = line.split(",")
+        if len(parts) != len(hdr):
+            break
+        rows.append(parts)
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows, columns=hdr)
+    keep_map = {
+        "台番号": "台番号", "棚段番号": "棚段番号", "棚位置": "棚位置",
+        "商品コード": "JAN", "フェース数": "フェース数", "在庫数量": "在庫数量",
+        "積上陳列数": "積上陳列数", "奥行陳列数": "奥行陳列数",
+    }
+    df = df.rename(columns=keep_map)
+    df["JAN"] = df["JAN"].astype(str).str.strip().str.lstrip("0").str.zfill(13)
+    for c in ["フェース数", "在庫数量", "積上陳列数", "奥行陳列数"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    df = df[df["JAN"].str.match(r"^\d{13}$") & (df["JAN"] != "0000000000000")].copy()
+    return {"name": name, "placement": df.reset_index(drop=True)}
+
+
 def compute_market(df_sri_long, df_trmaster,
                    group_cols, subcat_col, seg_col, subseg_col,
                    sel_period, sel_months) -> pd.DataFrame | None:
@@ -234,6 +286,8 @@ _IDPOS_CACHE    = pathlib.Path(__file__).parent / ".idpos_cache.parquet"
 _SRI_CACHE      = pathlib.Path(__file__).parent / ".sri_cache.parquet"
 _TRMASTER_CACHE = pathlib.Path(__file__).parent / ".trmaster_cache.parquet"
 _MASTER_CACHE   = pathlib.Path(__file__).parent / ".master_cache.parquet"
+_TANA_CACHE     = pathlib.Path(__file__).parent / ".tanawari_cache.parquet"
+_TANA_NAME      = pathlib.Path(__file__).parent / ".tanawari_name.txt"
 
 def save_trmaster(df: pd.DataFrame):
     df.to_parquet(_TRMASTER_CACHE, index=False)
@@ -265,6 +319,16 @@ def save_sri(df: pd.DataFrame):
 def load_sri_cache() -> pd.DataFrame | None:
     if _SRI_CACHE.exists():
         return pd.read_parquet(_SRI_CACHE)
+    return None
+
+def save_tanawari(data: dict):
+    data["placement"].to_parquet(_TANA_CACHE, index=False)
+    _TANA_NAME.write_text(data.get("name", "棚割"), encoding="utf-8")
+
+def load_tanawari_cache() -> dict | None:
+    if _TANA_CACHE.exists():
+        name = _TANA_NAME.read_text(encoding="utf-8").strip() if _TANA_NAME.exists() else "棚割"
+        return {"name": name, "placement": pd.read_parquet(_TANA_CACHE)}
     return None
 
 # ─────────────────────────────────────────────
@@ -316,11 +380,25 @@ with st.sidebar:
             if st.button("🗑️ TRマスタをリセット", key="trmaster_reset"):
                 _TRMASTER_CACHE.unlink(missing_ok=True)
                 st.rerun()
+
+        tana_file = st.file_uploader(
+            "⑤ 棚割CSV（共通棚割情報）", type=["csv"], key="tana",
+            help="棚POWER等の共通棚割情報フォーマット。アップロードするとローカルに保存されます",
+        )
+        if tana_file:
+            st.caption("✅ 棚割を保存しました（次回以降は不要）")
+        elif _TANA_CACHE.exists():
+            st.caption("💾 保存済み棚割を使用中")
+            if st.button("🗑️ 棚割をリセット", key="tana_reset"):
+                _TANA_CACHE.unlink(missing_ok=True)
+                _TANA_NAME.unlink(missing_ok=True)
+                st.rerun()
     else:
         idpos_file   = st.session_state.get("idpos")
         sri_file     = st.session_state.get("sri")
         master_file  = st.session_state.get("master")
         monthly_file = st.session_state.get("monthly")
+        tana_file    = st.session_state.get("tana")
 
 st.title("📊 メンズビューティ販売分析ダッシュボード")
 
@@ -357,6 +435,14 @@ with st.spinner("データ読み込み中..."):
         save_trmaster(df_trmaster)
     else:
         df_trmaster = load_trmaster_cache()
+
+    # 棚割: 新規アップロード → 保存 → 以降はキャッシュから
+    if tana_file:
+        tana_data = load_tanawari(tana_file)
+        if tana_data:
+            save_tanawari(tana_data)
+    else:
+        tana_data = load_tanawari_cache()
 
 # ─────────────────────────────────────────────
 # サイドバー: 期間・フィルタ設定
@@ -525,8 +611,8 @@ st.markdown("---")
 # ─────────────────────────────────────────────
 # タブ
 # ─────────────────────────────────────────────
-tab_seg, tab_subseg, tab_trend, tab_rank, tab_teiban = st.tabs(
-    ["📋 セグメント別", "🔬 サブセグメント別", "📈 月別トレンド", "🏆 単品ランキング", "🏪 定番分析"]
+tab_seg, tab_subseg, tab_trend, tab_rank, tab_teiban, tab_tana = st.tabs(
+    ["📋 セグメント別", "🔬 サブセグメント別", "📈 月別トレンド", "🏆 単品ランキング", "🏪 定番分析", "🗄️ 棚割分析"]
 )
 
 # ═══════════════════════════════════════════════
@@ -1214,6 +1300,197 @@ with tab_teiban:
                 .apply(color_teiban_table, axis=None),
                 use_container_width=True, hide_index=True, height=420,
             )
+
+# ═══════════════════════════════════════════════
+# Tab6: 棚割分析（フェース効率・台別実績）
+# ═══════════════════════════════════════════════
+with tab_tana:
+    if tana_data is None:
+        st.warning("サイドバー⑤から棚割CSV（共通棚割情報）をアップロードすると棚割分析が表示されます")
+    else:
+        placement = tana_data["placement"].copy()
+        st.subheader(f"棚割分析 — {tana_data['name']}")
+        st.caption(f"売上は {period_label}（絞り込みは無視し棚割内の全商品を対象）")
+
+        # 当期売上をJAN13単位で集計（絞り込みなし＝棚割全体をカバー）
+        sales_base = filter_months(df_all, sel_period, sel_months).copy()
+        sales_base["JAN13"] = sales_base["JAN"].astype(str).str.lstrip("0").str.zfill(13)
+        sales_jan = sales_base.groupby("JAN13").agg(
+            商品名=("商品名", "first"),
+            売上金額=("売上金額", "sum"),
+            売上数量=("売上数量", "sum"),
+        ).reset_index()
+        # 前期売上（昨対比用）
+        if "売上金額_前期" in sales_base.columns:
+            prev_jan = sales_base.groupby("JAN13")["売上金額_前期"].sum().reset_index().rename(
+                columns={"売上金額_前期": "前期売上"})
+            sales_jan = sales_jan.merge(prev_jan, on="JAN13", how="left")
+
+        # 棚割: JAN単位でフェース数・配置数を集計
+        face_jan = placement.groupby("JAN").agg(
+            フェース数=("フェース数", "sum"),
+            配置数=("JAN", "size"),
+        ).reset_index().rename(columns={"JAN": "JAN13"})
+        if "在庫数量" in placement.columns:
+            inv = placement.groupby("JAN")["在庫数量"].sum().reset_index().rename(
+                columns={"JAN": "JAN13", "在庫数量": "陳列在庫数"})
+            face_jan = face_jan.merge(inv, on="JAN13", how="left")
+
+        # 棚割 × 売上
+        tana_df = face_jan.merge(sales_jan, on="JAN13", how="left")
+        tana_df["売上金額"] = tana_df["売上金額"].fillna(0)
+        tana_df["売上数量"] = tana_df["売上数量"].fillna(0)
+        tana_df["商品名"] = tana_df["商品名"].fillna("（売上データなし）")
+        tana_df["1フェース売上"] = tana_df["売上金額"] / tana_df["フェース数"].replace(0, np.nan)
+
+        # シェアと効率判定
+        total_face  = tana_df["フェース数"].sum()
+        total_sales_t = tana_df["売上金額"].sum()
+        tana_df["フェースシェア"] = tana_df["フェース数"] / total_face * 100 if total_face else 0
+        tana_df["売上シェア"]     = tana_df["売上金額"] / total_sales_t * 100 if total_sales_t else 0
+        tana_df["効率比"] = tana_df["売上シェア"] / tana_df["フェースシェア"].replace(0, np.nan)
+
+        def judge_face(r):
+            if pd.isna(r["効率比"]):       return "❓ 判定不可"
+            if r["売上金額"] <= 0:          return "📉 フェース過剰"
+            if r["効率比"] >= 1.3:          return "📈 フェース増やすべき"
+            if r["効率比"] >= 0.7:          return "✅ 適正"
+            return "📉 フェース過剰"
+        tana_df["判定"] = tana_df.apply(judge_face, axis=1)
+
+        # ── KPI ──────────────────────────────────
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("総フェース数", f"{int(total_face):,}")
+        k2.metric("棚内商品数", f"{tana_df['JAN13'].nunique():,}")
+        k3.metric("棚内売上合計", fmt_yen(total_sales_t))
+        avg_face_sales = total_sales_t / total_face if total_face else 0
+        k4.metric("1フェース平均売上", fmt_yen(avg_face_sales))
+
+        # 売上ゼロ（死に筋）件数
+        dead = tana_df[tana_df["売上金額"] <= 0]
+        if len(dead) > 0:
+            st.caption(f"⚠️ 棚内で当期売上0の商品: {len(dead)}品（{dead['フェース数'].sum():.0f}フェース占有）")
+
+        st.markdown("---")
+
+        # ── フェース効率散布図 ──────────────────────
+        st.markdown("#### フェース効率マップ（フェース数 × 売上金額）")
+        JUDGE_COLOR = {
+            "📈 フェース増やすべき": "#2ca02c",
+            "✅ 適正": "#1f77b4",
+            "📉 フェース過剰": "#d62728",
+            "❓ 判定不可": "#cccccc",
+        }
+        plot_t = tana_df.copy()
+        figt = px.scatter(
+            plot_t, x="フェース数", y="売上金額",
+            color="判定", color_discrete_map=JUDGE_COLOR,
+            size="売上数量", hover_name="商品名",
+            hover_data={"JAN13": True, "フェース数": True, "1フェース売上": ":,.0f",
+                        "効率比": ":.2f", "売上金額": ":,.0f"},
+            title="右下＝売れてるのにフェース少（増やす）／左上はないが、低売上×多フェースは減らす",
+            size_max=40,
+        )
+        # 平均1フェース売上の基準線（y = avg * x）
+        if total_face:
+            xmax = plot_t["フェース数"].max()
+            figt.add_shape(type="line", x0=0, y0=0, x1=xmax, y1=avg_face_sales * xmax,
+                           line=dict(color="#888", dash="dash"))
+            figt.add_annotation(x=xmax, y=avg_face_sales * xmax, text="平均効率線",
+                                showarrow=False, font=dict(color="#888", size=10))
+        figt.update_layout(height=520, legend=dict(orientation="h", y=-0.2),
+                           yaxis=dict(title="売上金額（円）"))
+        st.plotly_chart(figt, use_container_width=True)
+
+        st.markdown("---")
+
+        # ── 台別・棚段別サマリー ─────────────────────
+        st.markdown("#### 台別・棚段別 実績サマリー")
+        # 配置に売上を結合（位置別）
+        pos = placement.merge(
+            tana_df[["JAN13", "売上金額", "売上数量"]].rename(columns={"JAN13": "JAN"}),
+            on="JAN", how="left")
+        # フェース按分で売上を位置に配分（同一JANが複数配置の場合）
+        face_total_by_jan = placement.groupby("JAN")["フェース数"].transform("sum")
+        pos["位置売上"] = pos["売上金額"].fillna(0) * (pos["フェース数"] / face_total_by_jan.replace(0, np.nan))
+
+        cda, cdb = st.columns(2)
+        with cda:
+            st.markdown("**台別**")
+            dai = pos.groupby("台番号").agg(
+                フェース数=("フェース数", "sum"),
+                商品数=("JAN", "nunique"),
+                売上金額=("位置売上", "sum"),
+            ).reset_index()
+            dai["1フェース売上"] = dai["売上金額"] / dai["フェース数"].replace(0, np.nan)
+            dai["売上構成比"] = dai["売上金額"] / dai["売上金額"].sum() * 100
+            st.dataframe(
+                dai.style.format({
+                    "フェース数": "{:.0f}", "商品数": "{:.0f}",
+                    "売上金額": "¥{:,.0f}", "1フェース売上": "¥{:,.0f}", "売上構成比": "{:.1f}%",
+                }, na_rep="—"),
+                use_container_width=True, hide_index=True,
+            )
+        with cdb:
+            st.markdown("**棚段別（台-段）**")
+            dan = pos.groupby(["台番号", "棚段番号"]).agg(
+                フェース数=("フェース数", "sum"),
+                売上金額=("位置売上", "sum"),
+            ).reset_index()
+            dan["1フェース売上"] = dan["売上金額"] / dan["フェース数"].replace(0, np.nan)
+            dan["台-段"] = dan["台番号"].astype(str) + "-" + dan["棚段番号"].astype(str)
+            st.dataframe(
+                dan[["台-段", "フェース数", "売上金額", "1フェース売上"]].style.format({
+                    "フェース数": "{:.0f}", "売上金額": "¥{:,.0f}", "1フェース売上": "¥{:,.0f}",
+                }, na_rep="—"),
+                use_container_width=True, hide_index=True, height=320,
+            )
+
+        st.markdown("---")
+
+        # ── フェース効率ランキング ───────────────────
+        st.markdown("#### 商品別フェース効率（効率比＝売上シェア÷フェースシェア）")
+        rank_cols = ["商品名", "JAN13", "フェース数", "売上金額", "売上数量",
+                     "1フェース売上", "フェースシェア", "売上シェア", "効率比", "判定"]
+        rank_cols = [c for c in rank_cols if c in tana_df.columns]
+        tana_rank = tana_df[rank_cols].sort_values("効率比", ascending=False, na_position="last")
+
+        def color_judge(df):
+            styles = pd.DataFrame("", index=df.index, columns=df.columns)
+            cmap = {"📈 フェース増やすべき": "#e8f5e9", "✅ 適正": "#e3f2fd",
+                    "📉 フェース過剰": "#ffebee", "❓ 判定不可": "#f5f5f5"}
+            if "判定" in df.columns:
+                for j, c in cmap.items():
+                    styles.loc[df["判定"] == j] = f"background-color:{c}"
+            return styles
+
+        make_download_button(tana_rank, f"棚割分析_{tana_data['name']}_{period_label}.csv")
+        st.dataframe(
+            tana_rank.style
+            .format({"フェース数": "{:.0f}", "売上金額": "¥{:,.0f}", "売上数量": "{:,.0f}",
+                     "1フェース売上": "¥{:,.0f}", "フェースシェア": "{:.2f}%",
+                     "売上シェア": "{:.2f}%", "効率比": "{:.2f}"}, na_rep="—")
+            .apply(color_judge, axis=None),
+            use_container_width=True, hide_index=True, height=460,
+        )
+
+        st.markdown("---")
+
+        # ── 棚未投入の売れ筋（機会損失） ───────────────
+        st.markdown("#### 🚨 棚未投入の売れ筋商品（機会損失）")
+        st.caption("棚割に入っていないが当期売上が立っている商品 TOP20")
+        in_shelf = set(tana_df["JAN13"])
+        not_in = sales_jan[~sales_jan["JAN13"].isin(in_shelf)].copy()
+        not_in = not_in[not_in["売上金額"] > 0].sort_values("売上金額", ascending=False).head(20)
+        if len(not_in) > 0:
+            show_ni = ["商品名", "JAN13", "売上金額", "売上数量"]
+            show_ni = [c for c in show_ni if c in not_in.columns]
+            st.dataframe(
+                not_in[show_ni].style.format({"売上金額": "¥{:,.0f}", "売上数量": "{:,.0f}"}, na_rep="—"),
+                use_container_width=True, hide_index=True,
+            )
+        else:
+            st.success("棚未投入の売れ筋はありません（売れ筋は全て棚割に入っています）")
 
 # ─────────────────────────────────────────────
 st.markdown("---")

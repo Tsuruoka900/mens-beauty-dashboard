@@ -13,6 +13,8 @@ __pycache__/
 .sri_cache.parquet
 .trmaster_cache.parquet
 .master_cache.parquet
+.tanawari_cache.parquet
+.tanawari_name.txt
 
 # ログ
 *.log
