@@ -50,6 +50,20 @@ def fmt_yoy(v):
     if pd.isna(v): return "—"
     return f"{v:.1f}%"
 
+def make_download_button(df: pd.DataFrame, filename: str, label: str = "📥 CSVダウンロード"):
+    """数値を適切な桁数に丸めてCSVダウンロードボタンを表示する。"""
+    # %列は小数点1桁、金額列は整数、その他数値は小数点1桁
+    out = df.copy()
+    for col in out.select_dtypes(include="number").columns:
+        if any(k in col for k in ["率","昨対","前年比","GAP"]):
+            out[col] = out[col].round(1)
+        elif any(k in col for k in ["金額","単価","売上"]):
+            out[col] = out[col].round(0).astype("Int64", errors="ignore")
+        else:
+            out[col] = out[col].round(1)
+    csv = out.to_csv(index=False, encoding="utf-8-sig")
+    st.download_button(label, csv, file_name=filename, mime="text/csv", use_container_width=True)
+
 # ─────────────────────────────────────────────
 # データ読み込み
 # ─────────────────────────────────────────────
@@ -609,6 +623,7 @@ with tab_seg:
             .apply(style_seg_table, axis=None),
             use_container_width=True, hide_index=True
         )
+        make_download_button(display_df, f"セグメント別_{period_label}.csv")
 
         # ウォーターフォール風棒グラフ（構成比ラベル付き）
         total_for_share = agg["売上金額"].sum()
@@ -753,6 +768,8 @@ with tab_subseg:
             .apply(color_yoy_cols, axis=None),
             use_container_width=True, hide_index=True
         )
+        make_download_button(agg_ss[show_cols].sort_values("売上金額", ascending=False),
+                             f"サブセグメント別_{period_label}.csv")
 
         # バブルチャート: 金額昨対 × 売上金額
         if "金額昨対" in agg_ss.columns:
@@ -984,6 +1001,7 @@ with tab_rank:
         .apply(color_rank_table, axis=None),
         use_container_width=True, hide_index=True, height=600,
     )
+    make_download_button(jan_agg[base_cols], f"単品ランキング_{period_label}.csv")
 
     # 横棒グラフ
     fig = px.bar(
@@ -1194,6 +1212,8 @@ with tab_teiban:
                 .apply(color_teiban_table, axis=None),
                 use_container_width=True, hide_index=True, height=420,
             )
+            make_download_button(jan_sales_disp[show_t].sort_values("売上金額", ascending=False),
+                                 f"定番分析_{period_label}.csv")
 
 # ─────────────────────────────────────────────
 st.markdown("---")
