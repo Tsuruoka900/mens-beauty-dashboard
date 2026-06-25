@@ -44,10 +44,12 @@ def mip_to_yyyymm(period: int, mip: int) -> int:
     return (total // 12) * 100 + (total % 12 + 1)
 
 def fmt_yen(v):
+    """金額を日本式の億/万表記で返す（例: ¥3.51億, ¥2,248万, ¥604）"""
     if pd.isna(v): return "—"
-    if abs(v) >= 1_000_000: return f"¥{v/1_000_000:.1f}M"
-    if abs(v) >= 1_000: return f"¥{v/1_000:.0f}K"
-    return f"¥{v:.0f}"
+    av = abs(v)
+    if av >= 1e8:  return f"¥{v/1e8:.2f}億"
+    if av >= 1e4:  return f"¥{v/1e4:,.0f}万"
+    return f"¥{v:,.0f}"
 
 def fmt_yoy(v):
     """昨対比を110.5%形式で表示。vは比率(110=前年比110%)"""
@@ -490,7 +492,16 @@ with st.sidebar:
 st.title("📊 メンズビューティ販売分析ダッシュボード")
 
 if idpos_file is None and not _IDPOS_CACHE.exists():
-    st.info("👈 サイドバーからIDPOS CSVをアップロードしてください")
+    st.info("👈 サイドバーの「① IDPOS CSV」をアップロードすると分析が始まります")
+    with st.expander("📂 各ファイルの役割（任意：入れるほど分析が充実）"):
+        st.markdown(
+            "- **① IDPOS CSV**（必須）… 売上・客数の元データ\n"
+            "- **② SRI Excel**（任意）… 市場前年比・市場GAPの算出に使用\n"
+            "- **③ マスタ CSV**（任意）… 採用店舗数＝定番分析に使用\n"
+            "- **④ TRマスタ Excel**（任意）… JAN→トライアル分類の変換に使用\n"
+            "- **⑤ 棚割CSV / ZIP**（任意）… 棚割分析・棚割図に使用\n\n"
+            "①以外は一度入れればローカルに保存され、次回以降は不要です。"
+        )
     st.stop()
 
 # ─────────────────────────────────────────────
@@ -549,7 +560,7 @@ available_months  = sorted(df_all["期内月"].unique())
 
 with st.sidebar:
     st.markdown("---")
-    st.header("📅 期・絞り込み")
+    st.header("📅 対象期")
 
     sel_period = st.selectbox(
         "期", available_periods, index=len(available_periods)-1,
@@ -558,7 +569,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.header("🔍 絞り込み")
-    st.caption("未選択＝全て表示　階層が連動します")
+    st.caption("未選択＝全て表示。階層が連動し、全タブに反映されます")
 
     # 階層フィルタ: サブカテゴリー
     df_filtered = df_all.copy()
@@ -605,7 +616,6 @@ with st.sidebar:
     if sel_subcats: filter_labels.append(f"サブカテ: {', '.join(sel_subcats)}")
     if sel_segs:    filter_labels.append(f"セグ: {', '.join(sel_segs)}")
     if sel_subsegs: filter_labels.append(f"サブセグ: {', '.join(sel_subsegs)}")
-    st.caption("絞り込みは全タブに反映されます")
 
 # ─────────────────────────────────────────────
 # メイン: 月選択UI（複数選択で自動累計）
@@ -667,31 +677,32 @@ def yoy_ratio(cur, prev):
 def fmt_yoy_ratio(v):
     return f"{v:.1f}%" if v is not None else "—"
 
-col1, col2, col3, col4, col5, col6 = st.columns(6)
+cols = st.columns(6)
 for col, label, cur_v, prev_v in [
-    (col1, "売上金額（税抜）", total_sales,       total_prev),
-    (col2, "売上数量",         total_qty,         total_qty_prev),
-    (col3, "平均単価",         total_avg_price,   total_avg_price_prev),
-    (col4, "購買単価",         total_price,       total_price_prev),
-    (col5, "POS客数",          total_pos,         total_pos_prev),
-    (col6, "ID客数",           total_id,          total_id_prev),
+    (cols[0], "売上金額（税抜）", total_sales,       total_prev),
+    (cols[1], "売上数量",         total_qty,         total_qty_prev),
+    (cols[2], "平均単価",         total_avg_price,   total_avg_price_prev),
+    (cols[3], "購買単価",         total_price,       total_price_prev),
+    (cols[4], "POS客数",          total_pos,         total_pos_prev),
+    (cols[5], "ID客数",           total_id,          total_id_prev),
 ]:
     ratio = yoy_ratio(cur_v, prev_v)
     val_str = fmt_yen(cur_v) if label in ("売上金額（税抜）", "平均単価", "購買単価") else f"{cur_v:,.0f}"
-    col.metric(label, val_str)
-    if ratio is not None:
-        color = "#2ca02c" if ratio >= 100 else "#d62728"
-        arrow = "▲" if ratio >= 100 else "▼"
-        col.markdown(
-            f'<div style="font-size:1.3rem; font-weight:bold; color:{color};">'
-            f'{arrow} {ratio:.1f}%</div>'
-            f'<div style="font-size:0.75rem; color:#888;">昨対比</div>',
-            unsafe_allow_html=True,
-        )
-    else:
-        col.caption("昨対比 —")
+    with col.container(border=True):
+        st.metric(label, val_str)
+        if ratio is not None:
+            color = "#2ca02c" if ratio >= 100 else "#d62728"
+            arrow = "▲" if ratio >= 100 else "▼"
+            st.markdown(
+                f'<div style="font-size:1.15rem; font-weight:bold; color:{color}; line-height:1.2;">'
+                f'{arrow} {ratio:.1f}%</div>'
+                f'<div style="font-size:0.7rem; color:#888;">昨対比</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.caption("昨対比 —")
 filter_summary = "　".join(filter_labels) if filter_labels else "絞り込みなし（全て）"
-st.caption(f"表示期間: {period_label}　　絞り込み: {filter_summary}")
+st.caption(f"📅 表示期間: **{period_label}**　🔍 絞り込み: {filter_summary}")
 
 st.markdown("---")
 
