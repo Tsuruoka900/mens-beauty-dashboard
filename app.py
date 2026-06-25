@@ -380,7 +380,7 @@ with st.sidebar:
 
     sel_period = st.selectbox(
         "期", available_periods, index=len(available_periods)-1,
-        format_func=lambda p: f"{p}期（{p+1993}年7月〜{p+1994}年6月）"
+        format_func=lambda p: f"{p}期（{p+1978}年7月〜{p+1979}年6月）"
     )
 
     st.markdown("---")
