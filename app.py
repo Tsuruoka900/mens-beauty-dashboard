@@ -554,6 +554,7 @@ def find_col(df, candidates):
 col_subcat = find_col(df_all, ["サブカテゴリー"])
 col_seg    = find_col(df_all, ["セグメント"])
 col_subseg = find_col(df_all, ["サブセグメント"])
+col_maker  = find_col(df_all, ["メーカー", "メーカー名"])
 
 available_periods = sorted(df_all["期"].unique())
 available_months  = sorted(df_all["期内月"].unique())
@@ -611,11 +612,25 @@ with st.sidebar:
     else:
         sel_subsegs = []
 
+    # メーカー（上位の絞り込みに連動）
+    if col_maker:
+        all_makers = sorted(df_filtered[col_maker].dropna().unique())
+        sel_makers = st.multiselect(
+            "④ メーカー", all_makers, default=[],
+            placeholder="すべて（未選択）",
+            key="filter_maker",
+        )
+        if sel_makers:
+            df_filtered = df_filtered[df_filtered[col_maker].isin(sel_makers)]
+    else:
+        sel_makers = []
+
     # 絞り込み状況サマリー
     filter_labels = []
     if sel_subcats: filter_labels.append(f"サブカテ: {', '.join(sel_subcats)}")
     if sel_segs:    filter_labels.append(f"セグ: {', '.join(sel_segs)}")
     if sel_subsegs: filter_labels.append(f"サブセグ: {', '.join(sel_subsegs)}")
+    if sel_makers:  filter_labels.append(f"メーカー: {', '.join(sel_makers)}")
 
 # ─────────────────────────────────────────────
 # メイン: 月選択UI（複数選択で自動累計）
