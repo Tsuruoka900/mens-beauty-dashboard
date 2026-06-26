@@ -142,6 +142,46 @@ def load_sri(file) -> pd.DataFrame:
 
 
 @st.cache_data
+def load_sri_from_report(file) -> pd.DataFrame | None:
+    """月次レポートExcelの「SRI」シート（月/JAN/市場金額/前年市場金額のロング形式）を
+    df_sri と同じロング形式（JAN, YYYYMM, 市場金額, 市場数量）に変換して返す。
+    当年・前年の両方の行を出力するので compute_market 系がそのまま使える。
+    """
+    try:
+        rs = pd.read_excel(file, sheet_name="SRI", dtype=str)
+    except Exception:
+        return None
+    rs.columns = [str(c).strip() for c in rs.columns]
+    need = {"月", "JAN", "市場金額", "前年市場金額"}
+    if not need.issubset(set(rs.columns)):
+        return None
+    rs["月"] = pd.to_numeric(rs["月"], errors="coerce")
+    for c in ["市場金額", "前年市場金額", "市場数量", "前年市場数量"]:
+        if c in rs.columns:
+            rs[c] = pd.to_numeric(rs[c], errors="coerce")
+    rs["JAN"] = rs["JAN"].astype(str).str.strip().str.lstrip("0").str.zfill(13)
+    rs = rs[rs["JAN"].str.match(r"^\d{13}$") & rs["月"].notna()].copy()
+    rs["月"] = rs["月"].astype(int)
+
+    # 月（暦月）→ 期内月 → 当期(最新期)/前期のYYYYMM
+    latest = 47  # アプリの最新期（PERIOD_47）。期を増やす際は要更新
+    rs["mip"]  = rs["月"].apply(ym_to_mip)
+    rs["cur"]  = rs["mip"].apply(lambda m: mip_to_yyyymm(latest, m))
+    rs["prev"] = rs["mip"].apply(lambda m: mip_to_yyyymm(latest - 1, m))
+
+    cur_df = rs[["JAN", "cur", "市場金額"]].rename(columns={"cur": "YYYYMM"})
+    cur_df["市場数量"] = rs["市場数量"] if "市場数量" in rs.columns else np.nan
+    prev_df = rs[["JAN", "prev", "前年市場金額"]].rename(
+        columns={"prev": "YYYYMM", "前年市場金額": "市場金額"})
+    prev_df["市場数量"] = rs["前年市場数量"] if "前年市場数量" in rs.columns else np.nan
+
+    out = pd.concat([cur_df, prev_df], ignore_index=True)
+    out = out[out["市場金額"].notna()].groupby(["JAN", "YYYYMM"], as_index=False).agg(
+        {"市場金額": "sum", "市場数量": "sum"})
+    return out[out["市場金額"] > 0].reset_index(drop=True)
+
+
+@st.cache_data
 def load_trmaster(file) -> pd.DataFrame:
     """月次レポートExcelからTRマスタシートを読み込む。
     返り値: JAN, サブカテゴリー名, セグメント名, サブセグメント名
@@ -322,21 +362,27 @@ def compute_market_total(df_sri_long, df_trmaster,
                          sel_period, sel_months) -> dict | None:
     """現在の階層絞り込みスコープの市場全体（今期・前年・前年比）を返す。
     メーカー絞り込みは適用しない（市場は全メーカー対象＝GAP比較の基準）。"""
-    if df_sri_long is None or df_trmaster is None:
+    if df_sri_long is None:
         return None
-    col_rename = {}
-    if subcat_col and "サブカテゴリー名" in df_trmaster.columns: col_rename["サブカテゴリー名"] = subcat_col
-    if seg_col    and "セグメント名"     in df_trmaster.columns: col_rename["セグメント名"]     = seg_col
-    if subseg_col and "サブセグメント名" in df_trmaster.columns: col_rename["サブセグメント名"] = subseg_col
-    mst = df_trmaster.rename(columns=col_rename)
-
-    joined = df_sri_long.merge(mst, on="JAN", how="inner")
-    if sel_subcats and subcat_col in joined.columns:
-        joined = joined[joined[subcat_col].isin(sel_subcats)]
-    if sel_segs and seg_col in joined.columns:
-        joined = joined[joined[seg_col].isin(sel_segs)]
-    if sel_subsegs and subseg_col in joined.columns:
-        joined = joined[joined[subseg_col].isin(sel_subsegs)]
+    has_filter = bool(sel_subcats or sel_segs or sel_subsegs)
+    if not has_filter:
+        # 絞り込みなし＝市場全体（TRマスタ突合不要＝公式の市場前年比と一致）
+        joined = df_sri_long
+    else:
+        if df_trmaster is None:
+            return None
+        col_rename = {}
+        if subcat_col and "サブカテゴリー名" in df_trmaster.columns: col_rename["サブカテゴリー名"] = subcat_col
+        if seg_col    and "セグメント名"     in df_trmaster.columns: col_rename["セグメント名"]     = seg_col
+        if subseg_col and "サブセグメント名" in df_trmaster.columns: col_rename["サブセグメント名"] = subseg_col
+        mst = df_trmaster.rename(columns=col_rename)
+        joined = df_sri_long.merge(mst, on="JAN", how="inner")
+        if sel_subcats and subcat_col in joined.columns:
+            joined = joined[joined[subcat_col].isin(sel_subcats)]
+        if sel_segs and seg_col in joined.columns:
+            joined = joined[joined[seg_col].isin(sel_segs)]
+        if sel_subsegs and subseg_col in joined.columns:
+            joined = joined[joined[subseg_col].isin(sel_subsegs)]
     if joined.empty:
         return None
 
@@ -468,8 +514,8 @@ with st.sidebar:
                 _IDPOS_CACHE.unlink(missing_ok=True)
                 st.rerun()
 
-        sri_file = st.file_uploader("② SRI Excel（更新時のみ）", type=["xlsx","xls"], key="sri",
-                                    help="アップロードするとローカルに保存され、次回以降は不要です")
+        sri_file = st.file_uploader("② SRI Excel（任意・予備）", type=["xlsx","xls"], key="sri",
+                                    help="④Monthly ReportのSRIシートがあればそちらを優先使用します。④が無い場合の予備です")
         if sri_file:
             st.caption("✅ SRIを保存しました（次回以降は不要）")
         elif _SRI_CACHE.exists():
@@ -490,9 +536,9 @@ with st.sidebar:
                 st.rerun()
 
         monthly_file  = st.file_uploader(
-            "④ TRマスタ Excel（半期更新）",
+            "④ Monthly Report Excel（TRマスタ＋SRI）",
             type=["xlsx","xls"], key="monthly",
-            help="アップロードするとローカルに保存され、次回以降は不要です",
+            help="月次レポートExcel。TRマスタ分類と市場データ（SRIシート）の両方をここから読み込みます",
         )
         if monthly_file:
             st.caption("✅ TRマスタを保存しました（次回以降は不要）")
@@ -547,12 +593,6 @@ with st.spinner("データ読み込み中..."):
     else:
         df_all = load_idpos_cache()
 
-    if sri_file:
-        df_sri = load_sri(sri_file)
-        save_sri(df_sri)
-    else:
-        df_sri = load_sri_cache()
-
     # マスタCSV: 新規アップロード → 保存 → 以降はキャッシュから
     if master_file:
         df_mst = load_master(master_file)
@@ -566,6 +606,17 @@ with st.spinner("データ読み込み中..."):
         save_trmaster(df_trmaster)
     else:
         df_trmaster = load_trmaster_cache()
+
+    # 市場データ（SRI）: 優先順 = ④Monthly ReportのSRIシート > ②SRI+エクスポート > キャッシュ
+    df_sri = None
+    if monthly_file:
+        df_sri = load_sri_from_report(monthly_file)
+    if df_sri is None and sri_file:
+        df_sri = load_sri(sri_file)
+    if df_sri is not None:
+        save_sri(df_sri)
+    else:
+        df_sri = load_sri_cache()
 
     # 棚割: 新規アップロード → 保存 → 以降はキャッシュから
     if tana_file:
