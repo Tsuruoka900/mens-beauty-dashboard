@@ -111,16 +111,17 @@ def load_sri(file) -> pd.DataFrame:
 
     # JAN列は "Unnamed: 2"（3列目）
     jan_col  = raw.columns[2]
-    # 月次金額列: "YYYY/M-"、月次数量列: "YYYY/M-.1"
-    amt_map = {}  # YYYYMM → col_name
-    qty_map = {}
+    # SRI+は2ブロック横並び：前半=個数(列名 "YYYY/M-")、後半=金額(pandasが重複名に付けた "YYYY/M-.1")
+    # ＝金額は ".1" 付き、数量は接尾辞なし
+    amt_map = {}  # 金額: YYYYMM → col_name
+    qty_map = {}  # 数量: YYYYMM → col_name
     for c in raw.columns:
-        m = re.match(r'^(\d{4})/(\d{1,2})-$', c)
-        if m:
-            amt_map[int(m.group(1)) * 100 + int(m.group(2))] = c
-        m2 = re.match(r'^(\d{4})/(\d{1,2})-\.1$', c)
-        if m2:
-            qty_map[int(m2.group(1)) * 100 + int(m2.group(2))] = c
+        m_qty = re.match(r'^(\d{4})/(\d{1,2})-$', c)        # 接尾辞なし = 個数
+        if m_qty:
+            qty_map[int(m_qty.group(1)) * 100 + int(m_qty.group(2))] = c
+        m_amt = re.match(r'^(\d{4})/(\d{1,2})-\.1$', c)     # ".1" = 金額
+        if m_amt:
+            amt_map[int(m_amt.group(1)) * 100 + int(m_amt.group(2))] = c
 
     # JAN が13桁数字の行だけ残す
     raw["JAN"] = raw[jan_col].astype(str).str.strip().str.lstrip("0").str.zfill(13)
@@ -139,46 +140,6 @@ def load_sri(file) -> pd.DataFrame:
 
     out = pd.concat(records, ignore_index=True)
     return out[out["市場金額"].notna() & (out["市場金額"] > 0)].copy()
-
-
-@st.cache_data
-def load_sri_from_report(file) -> pd.DataFrame | None:
-    """月次レポートExcelの「SRI」シート（月/JAN/市場金額/前年市場金額のロング形式）を
-    df_sri と同じロング形式（JAN, YYYYMM, 市場金額, 市場数量）に変換して返す。
-    当年・前年の両方の行を出力するので compute_market 系がそのまま使える。
-    """
-    try:
-        rs = pd.read_excel(file, sheet_name="SRI", dtype=str)
-    except Exception:
-        return None
-    rs.columns = [str(c).strip() for c in rs.columns]
-    need = {"月", "JAN", "市場金額", "前年市場金額"}
-    if not need.issubset(set(rs.columns)):
-        return None
-    rs["月"] = pd.to_numeric(rs["月"], errors="coerce")
-    for c in ["市場金額", "前年市場金額", "市場数量", "前年市場数量"]:
-        if c in rs.columns:
-            rs[c] = pd.to_numeric(rs[c], errors="coerce")
-    rs["JAN"] = rs["JAN"].astype(str).str.strip().str.lstrip("0").str.zfill(13)
-    rs = rs[rs["JAN"].str.match(r"^\d{13}$") & rs["月"].notna()].copy()
-    rs["月"] = rs["月"].astype(int)
-
-    # 月（暦月）→ 期内月 → 当期(最新期)/前期のYYYYMM
-    latest = 47  # アプリの最新期（PERIOD_47）。期を増やす際は要更新
-    rs["mip"]  = rs["月"].apply(ym_to_mip)
-    rs["cur"]  = rs["mip"].apply(lambda m: mip_to_yyyymm(latest, m))
-    rs["prev"] = rs["mip"].apply(lambda m: mip_to_yyyymm(latest - 1, m))
-
-    cur_df = rs[["JAN", "cur", "市場金額"]].rename(columns={"cur": "YYYYMM"})
-    cur_df["市場数量"] = rs["市場数量"] if "市場数量" in rs.columns else np.nan
-    prev_df = rs[["JAN", "prev", "前年市場金額"]].rename(
-        columns={"prev": "YYYYMM", "前年市場金額": "市場金額"})
-    prev_df["市場数量"] = rs["前年市場数量"] if "前年市場数量" in rs.columns else np.nan
-
-    out = pd.concat([cur_df, prev_df], ignore_index=True)
-    out = out[out["市場金額"].notna()].groupby(["JAN", "YYYYMM"], as_index=False).agg(
-        {"市場金額": "sum", "市場数量": "sum"})
-    return out[out["市場金額"] > 0].reset_index(drop=True)
 
 
 @st.cache_data
@@ -514,8 +475,8 @@ with st.sidebar:
                 _IDPOS_CACHE.unlink(missing_ok=True)
                 st.rerun()
 
-        sri_file = st.file_uploader("② SRI Excel（任意・予備）", type=["xlsx","xls"], key="sri",
-                                    help="④Monthly ReportのSRIシートがあればそちらを優先使用します。④が無い場合の予備です")
+        sri_file = st.file_uploader("② SRI Excel（更新時のみ）", type=["xlsx","xls"], key="sri",
+                                    help="SRI+エクスポート（2年分・男性用全体）。市場前年比・GAPの算出に使用")
         if sri_file:
             st.caption("✅ SRIを保存しました（次回以降は不要）")
         elif _SRI_CACHE.exists():
@@ -536,9 +497,9 @@ with st.sidebar:
                 st.rerun()
 
         monthly_file  = st.file_uploader(
-            "④ Monthly Report Excel（TRマスタ＋SRI）",
+            "④ TRマスタ Excel（半期更新）",
             type=["xlsx","xls"], key="monthly",
-            help="月次レポートExcel。TRマスタ分類と市場データ（SRIシート）の両方をここから読み込みます",
+            help="月次レポートExcelのTRマスタシート（JAN→トライアル分類）を読み込みます",
         )
         if monthly_file:
             st.caption("✅ TRマスタを保存しました（次回以降は不要）")
@@ -607,13 +568,9 @@ with st.spinner("データ読み込み中..."):
     else:
         df_trmaster = load_trmaster_cache()
 
-    # 市場データ（SRI）: 優先順 = ④Monthly ReportのSRIシート > ②SRI+エクスポート > キャッシュ
-    df_sri = None
-    if monthly_file:
-        df_sri = load_sri_from_report(monthly_file)
-    if df_sri is None and sri_file:
+    # 市場データ（SRI）: ②SRI+エクスポートから抽出（更新時のみ） → 以降はキャッシュ
+    if sri_file:
         df_sri = load_sri(sri_file)
-    if df_sri is not None:
         save_sri(df_sri)
     else:
         df_sri = load_sri_cache()
