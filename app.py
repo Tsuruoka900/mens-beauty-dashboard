@@ -315,6 +315,39 @@ def compute_market(df_sri_long, df_trmaster,
             mrk[c] = np.nan
     return mrk
 
+
+def compute_market_total(df_sri_long, df_trmaster,
+                         subcat_col, seg_col, subseg_col,
+                         sel_subcats, sel_segs, sel_subsegs,
+                         sel_period, sel_months) -> dict | None:
+    """現在の階層絞り込みスコープの市場全体（今期・前年・前年比）を返す。
+    メーカー絞り込みは適用しない（市場は全メーカー対象＝GAP比較の基準）。"""
+    if df_sri_long is None or df_trmaster is None:
+        return None
+    col_rename = {}
+    if subcat_col and "サブカテゴリー名" in df_trmaster.columns: col_rename["サブカテゴリー名"] = subcat_col
+    if seg_col    and "セグメント名"     in df_trmaster.columns: col_rename["セグメント名"]     = seg_col
+    if subseg_col and "サブセグメント名" in df_trmaster.columns: col_rename["サブセグメント名"] = subseg_col
+    mst = df_trmaster.rename(columns=col_rename)
+
+    joined = df_sri_long.merge(mst, on="JAN", how="inner")
+    if sel_subcats and subcat_col in joined.columns:
+        joined = joined[joined[subcat_col].isin(sel_subcats)]
+    if sel_segs and seg_col in joined.columns:
+        joined = joined[joined[seg_col].isin(sel_segs)]
+    if sel_subsegs and subseg_col in joined.columns:
+        joined = joined[joined[subseg_col].isin(sel_subsegs)]
+    if joined.empty:
+        return None
+
+    today_yms = [mip_to_yyyymm(sel_period,     m) for m in sel_months]
+    prev_yms  = [mip_to_yyyymm(sel_period - 1, m) for m in sel_months]
+    today = joined[joined["YYYYMM"].isin(today_yms)]["市場金額"].sum()
+    prev  = joined[joined["YYYYMM"].isin(prev_yms)]["市場金額"].sum()
+    if prev <= 0:
+        return None
+    return {"今期": today, "前年": prev, "前年比": today / prev * 100}
+
 @st.cache_data
 def load_master(file) -> pd.DataFrame:
     df = pd.read_csv(file, encoding="cp932", dtype=str)
@@ -718,6 +751,28 @@ for col, label, cur_v, prev_v in [
             st.caption("昨対比 —")
 filter_summary = "　".join(filter_labels) if filter_labels else "絞り込みなし（全て）"
 st.caption(f"📅 表示期間: **{period_label}**　🔍 絞り込み: {filter_summary}")
+
+# ── 市場比較（SRI）：市場前年比・昨対GAP ──────────────
+mkt_total = compute_market_total(
+    df_sri, df_trmaster, col_subcat, col_seg, col_subseg,
+    sel_subcats, sel_segs, sel_subsegs, sel_period, sel_months)
+self_yoy = yoy_ratio(total_sales, total_prev)
+if mkt_total is not None and self_yoy is not None:
+    mkt_yoy = mkt_total["前年比"]
+    gap = self_yoy - mkt_yoy
+    with st.container(border=True):
+        m1, m2, m3 = st.columns(3)
+        m1.metric("🏪 市場前年比（SRI）", f"{mkt_yoy:.1f}%")
+        m2.metric("📊 自社 昨対比", f"{self_yoy:.1f}%")
+        gap_color = "#2ca02c" if gap >= 0 else "#d62728"
+        verdict = "市場を上回る🎉" if gap >= 0 else "市場に未達"
+        m3.metric("⚖️ 昨対GAP（自社−市場）", f"{gap:+.1f}pt")
+        m3.markdown(
+            f'<div style="font-size:0.8rem; color:{gap_color}; font-weight:bold;">{verdict}</div>',
+            unsafe_allow_html=True)
+    st.caption("※市場は全メーカー対象（メーカー絞り込みは市場側には適用されません）")
+elif df_sri is None or df_trmaster is None:
+    st.caption("💡 ②SRIと④TRマスタを入れると、ここに市場前年比・昨対GAPが表示されます")
 
 st.markdown("---")
 
